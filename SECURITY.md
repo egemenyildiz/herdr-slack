@@ -22,6 +22,9 @@ Anyone able to act through the bot can run commands as you. Mitigations, all on 
 - **DM-only.** Conversations outside a DM are refused; there is no channel-feed path.
 - **Opaque refs.** Interactive payloads carry a random reference resolved server-side; a crafted
   payload cannot name an arbitrary pane. Unknown or dead refs fail closed.
+- **herdr must be reachable.** When the Unix socket is down (or the machine is asleep and the
+  daemon cannot talk to Slack), session and Home controls are omitted and mutating actions are
+  refused. There is no wake-from-Slack — keep the computer awake to drive agents from a phone.
 - **Confirmation on the one destructive control.** *End session* closes the pane, so it is gated by a
   Slack confirm dialog that names that consequence. The pane id is resolved from `terminal_id` at
   click time, so a moved pane cannot make it land on a different terminal.

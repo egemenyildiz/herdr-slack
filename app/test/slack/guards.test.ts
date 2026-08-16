@@ -191,6 +191,13 @@ describe("authorizeAction", () => {
     const result = authorizeAction(deps(), ctx(), "w1:p1");
     expect(result.decision.reason).toBe("unknown_ref");
   });
+
+  it("refuses when herdr is offline, before resolving the ref", () => {
+    const result = authorizeAction(deps({ isHerdrConnected: () => false }), ctx(), "good");
+    expect(result.decision.reason).toBe("herdr_offline");
+    expect(result.terminalId).toBeUndefined();
+    expect(result.decision.message).toMatch(/not reachable/i);
+  });
 });
 
 describe("isActionableMessage", () => {

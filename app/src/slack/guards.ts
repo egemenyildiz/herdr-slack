@@ -9,7 +9,8 @@ export type DenyReason =
   | "throttled"
   | "unknown_ref"
   | "session_ended"
-  | "channel_not_permitted";
+  | "channel_not_permitted"
+  | "herdr_offline";
 
 export interface Decision {
   allowed: boolean;
@@ -26,6 +27,8 @@ const DENY_TEXT: Record<DenyReason, string> = {
   unknown_ref: "That button is from an older message and no longer works.",
   session_ended: "That session has ended.",
   channel_not_permitted: "This bot only takes commands in a direct message.",
+  herdr_offline:
+    "Your computer is not reachable right now — wake it and keep herdr running to use Slack controls.",
 };
 
 function deny(reason: DenyReason): Decision {
@@ -62,6 +65,13 @@ export interface GuardDeps {
   resolveRef?: (ref: string) => string | undefined;
   /** Whether a terminal is still live. */
   isLive?: (terminalId: string) => boolean;
+  /**
+   * Whether the herdr Unix socket is connected.
+   *
+   * Absent means "assume connected" so unit tests that do not model the tail
+   * stay focused. Production always wires the live EventTail status.
+   */
+  isHerdrConnected?: () => boolean;
 }
 
 /** Gate any inbound interaction: workspace, identity, channel, rate. */
@@ -95,7 +105,20 @@ export function resolveTarget(deps: GuardDeps, ref: string): TargetResolution {
   return { decision: ALLOW, terminalId };
 }
 
-/** Both gates, in the order they must run. */
+/**
+ * Fail closed when herdr is down.
+ *
+ * Sleep freezes the whole machine, so Slack cannot be updated then either —
+ * this covers the awake-but-herdr-down case (and any stale button that was
+ * rendered before a disconnect). Home Refresh stays on `checkInbound` alone
+ * so the user can still poke the UI while waiting.
+ */
+export function requireHerdr(deps: GuardDeps): Decision {
+  if (deps.isHerdrConnected && !deps.isHerdrConnected()) return deny("herdr_offline");
+  return ALLOW;
+}
+
+/** Identity + herdr reachability + ref resolution, in that order. */
 export function authorizeAction(
   deps: GuardDeps,
   ctx: InboundContext,
@@ -103,5 +126,7 @@ export function authorizeAction(
 ): TargetResolution {
   const inbound = checkInbound(deps, ctx);
   if (!inbound.allowed) return { decision: inbound };
+  const herdr = requireHerdr(deps);
+  if (!herdr.allowed) return { decision: herdr };
   return resolveTarget(deps, ref);
 }

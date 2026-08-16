@@ -102,6 +102,17 @@ describe("controls", () => {
     expect(rendered).toContain("read-only");
   });
 
+  it("strips every control when herdr is offline", () => {
+    const rendered = json(
+      sessionCard({ ...view({ status: "idle" }), herdrConnected: false }, record()).blocks,
+    );
+    expect(rendered).not.toContain(SESSION_ACTIONS.reply);
+    expect(rendered).not.toContain(SESSION_ACTIONS.refresh);
+    expect(rendered).not.toContain(SESSION_ACTIONS.history);
+    expect(rendered).not.toContain(SESSION_ACTIONS.end);
+    expect(rendered).toContain("Computer unreachable");
+  });
+
   it("confirms End session and says the terminal is closed", () => {
     const rendered = json(sessionCard(view({ status: "idle" }), record()).blocks);
     expect(rendered).toContain("closes the terminal");

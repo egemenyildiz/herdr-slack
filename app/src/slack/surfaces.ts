@@ -9,7 +9,13 @@ import type { SessionState } from "../herdr/state.js";
 import type { AgentStatus } from "../herdr/types.js";
 import { type SessionRegistry, sweepOrphans } from "../registry/registry.js";
 import { escapeMrkdwn } from "./format.js";
-import { ActionThrottle, type GuardDeps, authorizeAction, checkInbound } from "./guards.js";
+import {
+  ActionThrottle,
+  type GuardDeps,
+  authorizeAction,
+  checkInbound,
+  requireHerdr,
+} from "./guards.js";
 import { GLYPH, type HomeAgent, agentFromPane, buildHome } from "./home.js";
 import { resolveThreadPermalink } from "./links.js";
 import {
@@ -24,8 +30,8 @@ import {
 } from "./modals.js";
 import { SessionController } from "./session-controller.js";
 import { SESSION_ACTIONS } from "./session.js";
-import type { SlackTransport, ViewSubmitResult } from "./transport.js";
-import { type InboundContext, inboundMessageDedupeKey } from "./transport.js";
+import type { InboundContext, SlackTransport, ViewSubmitResult } from "./transport.js";
+import { inboundMessageDedupeKey } from "./transport.js";
 
 /** Keep the reply modal open, with the reason under the text box. */
 const replyError = (message: string): ViewSubmitResult => ({
@@ -67,6 +73,7 @@ export interface SurfacesDeps {
 /** Wires herdr state to Slack surfaces; inbound actions go through guards first. */
 export class Surfaces {
   #homeTimer: NodeJS.Timeout | null = null;
+  #cardTimer: NodeJS.Timeout | null = null;
   /** userId → DM channel, for interactions that arrive without one. */
   #dmChannels = new Map<string, string>();
   /** Who acted most recently, so a note can be addressed even deep in a helper. */
@@ -82,6 +89,7 @@ export class Surfaces {
   #seenMessageKeys = new Set<string>();
 
   constructor(private readonly deps: SurfacesDeps) {
+    const isHerdrConnected = (): boolean => deps.tail.status === "connected";
     this.#sessions = new SessionController({
       config: deps.config,
       client: deps.client,
@@ -89,12 +97,14 @@ export class Surfaces {
       registry: deps.registry,
       transport: deps.transport,
       log: deps.log,
+      isHerdrConnected,
     });
     this.#guards = {
       config: deps.config,
       throttle: new ActionThrottle(),
       resolveRef: (ref) => deps.registry.terminalForRef(ref),
       isLive: (terminalId) => deps.state.paneByTerminal(terminalId) !== undefined,
+      isHerdrConnected,
     };
   }
 
@@ -121,9 +131,19 @@ export class Surfaces {
         }
         if (actionId === "home_refresh") {
           await this.publishHome(ctx.userId);
-        } else {
-          await this.#openNewAgentModal(triggerId);
+          return;
         }
+        // New agent needs a live herdr; Refresh does not.
+        const herdr = requireHerdr(this.#guards);
+        if (!herdr.allowed) {
+          log(`action ${actionId} denied: ${herdr.reason}`);
+          await this.#ephemeral(
+            await this.#replyChannel(ctx),
+            herdr.message ?? "herdr is not connected.",
+          );
+          return;
+        }
+        await this.#openNewAgentModal(triggerId);
         return;
       }
       // Menu choices pack ref:digit; extract the ref before authorisation.
@@ -190,34 +210,16 @@ export class Surfaces {
     tail.on("status", ({ status }) => {
       if (status === "connected") this.#lastSyncAt = Date.now();
       this.#scheduleHome();
+      // Strip or restore session-card buttons when herdr flaps. Sleep freezes
+      // us before we can do this; this covers awake-but-disconnected.
+      this.#scheduleCards();
     });
     transport.onConnectionChange((connected) => {
       log(`slack: ${connected ? "connected" : "disconnected"}`);
       if (connected) this.#scheduleHome();
     });
 
-    transport.onViewSubmit(async ({ ctx, callbackId, view, privateMetadata }) => {
-      const decision = checkInbound(this.#guards, ctx);
-      if (!decision.allowed) {
-        log(`view submit denied: ${decision.reason}`);
-        return;
-      }
-      if (callbackId === MODAL_IDS.newAgent) {
-        await this.#launchFromModal(ctx.userId, await this.#replyChannel(ctx), view);
-        return;
-      }
-      if (callbackId === MODAL_IDS.reply) {
-        const terminalId = this.deps.registry.terminalForRef(privateMetadata ?? "");
-        const prompt = parseReplySubmission(view);
-        if (!terminalId || !prompt) {
-          log("reply modal rejected: missing target or prompt");
-          return replyError("That session is no longer available — reopen it from Home.");
-        }
-        const error = await this.#submitTurn(terminalId, prompt);
-        if (error) return replyError(error);
-      }
-      return;
-    });
+    transport.onViewSubmit(async (input) => this.#onViewSubmit(input));
 
     // Post settled agent output to the session thread on status transition.
     state.on("transition", ({ terminalId, to, from }) => {
@@ -367,6 +369,47 @@ export class Surfaces {
     this.#scheduleHome();
   }
 
+  async #onViewSubmit(input: {
+    ctx: InboundContext;
+    callbackId: string;
+    view: unknown;
+    privateMetadata?: string;
+  }): Promise<ViewSubmitResult | undefined> {
+    const { ctx, callbackId, view, privateMetadata } = input;
+    const { log } = this.deps;
+    const decision = checkInbound(this.#guards, ctx);
+    if (!decision.allowed) {
+      log(`view submit denied: ${decision.reason}`);
+      return;
+    }
+    const herdr = requireHerdr(this.#guards);
+    if (!herdr.allowed) {
+      log(`view submit denied: ${herdr.reason}`);
+      if (callbackId === MODAL_IDS.reply) {
+        return replyError(herdr.message ?? "herdr is not connected.");
+      }
+      await this.#ephemeral(
+        await this.#replyChannel(ctx),
+        herdr.message ?? "herdr is not connected.",
+      );
+      return;
+    }
+    if (callbackId === MODAL_IDS.newAgent) {
+      await this.#launchFromModal(ctx.userId, await this.#replyChannel(ctx), view);
+      return;
+    }
+    if (callbackId !== MODAL_IDS.reply) return;
+    const terminalId = this.deps.registry.terminalForRef(privateMetadata ?? "");
+    const prompt = parseReplySubmission(view);
+    if (!terminalId || !prompt) {
+      log("reply modal rejected: missing target or prompt");
+      return replyError("That session is no longer available — reopen it from Home.");
+    }
+    const error = await this.#submitTurn(terminalId, prompt);
+    if (error) return replyError(error);
+    return;
+  }
+
   /** Open the launch modal; skeleton first because trigger_id expires quickly. */
   async #openNewAgentModal(triggerId: string): Promise<void> {
     const viewId = await this.deps.transport.openModal(triggerId, skeletonModal("New agent"));
@@ -440,6 +483,8 @@ export class Surfaces {
   stop(): void {
     if (this.#homeTimer) clearTimeout(this.#homeTimer);
     this.#homeTimer = null;
+    if (this.#cardTimer) clearTimeout(this.#cardTimer);
+    this.#cardTimer = null;
     for (const timer of this.#agentGoneTimers.values()) clearTimeout(timer);
     this.#agentGoneTimers.clear();
     for (const timer of this.#cursorIdleTimers.values()) clearTimeout(timer);
@@ -755,6 +800,19 @@ export class Surfaces {
       }
     }, HOME_DEBOUNCE_MS);
     this.#homeTimer.unref?.();
+  }
+
+  /** Republish open session cards so controls appear/disappear with herdr liveness. */
+  #scheduleCards(): void {
+    if (this.#cardTimer) return;
+    this.#cardTimer = setTimeout(() => {
+      this.#cardTimer = null;
+      for (const [terminalId, record] of this.deps.registry.entries()) {
+        if (record.ended || !record.slackThreadTs || !record.slackChannel) continue;
+        void this.#sessions.updateCard(terminalId);
+      }
+    }, HOME_DEBOUNCE_MS);
+    this.#cardTimer.unref?.();
   }
 
   /** Resolve a reply channel; App Home and modals may omit one. */
