@@ -7,7 +7,6 @@ export interface ManifestOptions {
 
 /** Scopes needed for the DM-only control plane. Each is load-bearing. */
 export const BASE_SCOPES = [
-  "commands", // /herd
   "chat:write", // post and update every surface
   "im:history", // receive DM replies
   "im:write", // open the DM in the first place
@@ -50,23 +49,6 @@ export function renderManifest(options: ManifestOptions): string {
         messages_tab_enabled: true,
         messages_tab_read_only_enabled: false,
       },
-      slash_commands: [
-        {
-          // Socket Mode delivers slash commands; no request URL needed.
-          command: "/herd",
-          description: "Browse, start, and control herdr agents",
-          usage_hint: "[new|blocked|<agent name>]",
-          should_escape: false,
-        },
-      ],
-      shortcuts: [
-        {
-          name: "Herd",
-          type: "global",
-          callback_id: "herd_open",
-          description: "Open the herdr control panel",
-        },
-      ],
     },
     oauth_config: { scopes: { bot: scopesFor(options) } },
     settings: {
@@ -120,7 +102,6 @@ Security policy:          ${REPO_URL}/blob/main/SECURITY.md`;
 }
 
 const SCOPE_REASON: Record<string, string> = {
-  commands: "the /herd slash command",
   "chat:write": "post and update messages",
   "im:history": "read my replies in a DM thread",
   "im:write": "open a DM with me",

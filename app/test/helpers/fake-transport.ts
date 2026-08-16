@@ -1,6 +1,5 @@
 import type {
   ActionHandler,
-  CommandHandler,
   HomeHandler,
   MessageHandler,
   PostInput,
@@ -32,7 +31,6 @@ export class FakeTransport implements SlackTransport {
   #action: ActionHandler | null = null;
   #viewSubmit: ViewSubmitHandler | null = null;
   #message: MessageHandler | null = null;
-  #command: CommandHandler | null = null;
   #home: HomeHandler | null = null;
   #connection: ((connected: boolean) => void)[] = [];
 
@@ -110,9 +108,6 @@ export class FakeTransport implements SlackTransport {
   onMessage(handler: MessageHandler): void {
     this.#message = handler;
   }
-  onCommand(handler: CommandHandler): void {
-    this.#command = handler;
-  }
   onHomeOpened(handler: HomeHandler): void {
     this.#home = handler;
   }
@@ -132,10 +127,6 @@ export class FakeTransport implements SlackTransport {
 
   emitMessage(input: Parameters<MessageHandler>[0]): Promise<void> {
     return this.#message?.(input) ?? Promise.resolve();
-  }
-
-  emitCommand(input: Parameters<CommandHandler>[0]): Promise<void> {
-    return this.#command?.(input) ?? Promise.resolve();
   }
 
   setConnected(connected: boolean): void {

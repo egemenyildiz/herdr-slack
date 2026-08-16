@@ -190,7 +190,7 @@ export function writeExampleCatalog(file = catalogPath()): void {
   const lines = [
     "# Agent launch modes for herdr-slack.",
     "#",
-    "# Only kinds listed here get mode choices in `/herd new`; anything else",
+    "# Only kinds listed here get mode choices in the New agent modal; anything else",
     "# starts with its own defaults. Add a kind when you have verified its flags",
     "# actually work — a mode that fails at launch is worse than no mode.",
     "",

@@ -73,7 +73,10 @@ equivalent command is `node app/dist/cli.js reset --yes`.
 
 ## Usage
 
-- **Home tab** — agents grouped by workspace; blocked agents listed first.
+Everything is driven from the app's UI — there are no slash commands.
+
+- **Home tab** — the hub: agents grouped by workspace, blocked agents first. **＋ New agent** launches
+  one (workspace, directory, kind, first prompt); **Open** brings up a session card.
 - **Session cards** — one updating card per agent: latest Slack prompt, latest response, and the
   agent's state in words (*Working*, *Waiting on you*, *Idle*, *Finished*).
 - **Reply** — opens a modal and starts one tracked remote turn; the card updates automatically when
@@ -89,8 +92,6 @@ equivalent command is `node app/dist/cli.js reset --yes`.
   card read-only. Confirm-gated, because it is destructive: sending `Ctrl-C` instead was pointless,
   since agents like Cursor ignore it. Reopening the agent from the *Home* tab re-attaches a fresh
   card as long as the terminal is still alive.
-- **`/herd`** — browse and open sessions.
-- **`/herd new`** — launch an agent (workspace, directory, kind, mode, first prompt).
 
 Session cards intentionally do not mirror the full terminal or accept ordinary thread replies.
 Use the card's **Reply** button so each prompt has one response and reconnects cannot replay it.

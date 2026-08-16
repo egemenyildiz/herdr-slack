@@ -24,10 +24,10 @@ describe("manifest", () => {
     expect(parsed.settings.interactivity.is_enabled).toBe(true);
   });
 
-  it("omits a slash-command url, which Socket Mode does not need", () => {
+  it("declares no slash commands — the app is driven from the UI", () => {
     const parsed = JSON.parse(renderManifest({ appName: "Herdr" }));
-    expect(parsed.features.slash_commands[0].url).toBeUndefined();
-    expect(parsed.features.slash_commands[0].command).toBe("/herd");
+    expect(parsed.features.slash_commands).toBeUndefined();
+    expect(parsed.features.shortcuts).toBeUndefined();
   });
 
   it("enables the Home tab, which is the main surface", () => {
@@ -41,11 +41,12 @@ describe("manifest", () => {
     expect(scopes).not.toContain("channels:history");
     expect(scopes).not.toContain("groups:history");
     expect(scopes).not.toContain("users:read");
+    expect(scopes).not.toContain("commands");
   });
 
   it("always includes the scopes each surface actually needs", () => {
     const scopes = scopesFor({ appName: "Herdr" });
-    for (const required of ["chat:write", "im:history", "commands", "assistant:write"]) {
+    for (const required of ["chat:write", "im:history", "assistant:write"]) {
       expect(scopes).toContain(required);
     }
   });

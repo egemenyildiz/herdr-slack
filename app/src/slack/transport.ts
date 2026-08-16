@@ -49,7 +49,6 @@ export interface SlackTransport {
   onAction(handler: ActionHandler): void;
   onViewSubmit(handler: ViewSubmitHandler): void;
   onMessage(handler: MessageHandler): void;
-  onCommand(handler: CommandHandler): void;
   onHomeOpened(handler: HomeHandler): void;
   onConnectionChange(handler: (connected: boolean) => void): void;
 }
@@ -114,12 +113,6 @@ export type ActionHandler = (input: {
 }) => Promise<void>;
 
 export type MessageHandler = (input: { ctx: InboundContext; text: string }) => Promise<void>;
-
-export type CommandHandler = (input: {
-  ctx: InboundContext;
-  text: string;
-  triggerId: string;
-}) => Promise<void>;
 
 export type HomeHandler = (input: { ctx: InboundContext }) => Promise<void>;
 

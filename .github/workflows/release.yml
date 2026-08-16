@@ -8,6 +8,14 @@ permissions:
   contents: write
   pull-requests: write
 
+# release-please opens a release PR, which also needs the repo setting
+# "Allow GitHub Actions to create and approve pull requests"
+# (Settings → Actions → General → Workflow permissions). Without it the run
+# fails with "GitHub Actions is not permitted to create or approve pull
+# requests". Enable via:
+#   gh api -X PUT repos/OWNER/REPO/actions/permissions/workflow \
+#     -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
+
 jobs:
   release-please:
     runs-on: ubuntu-latest

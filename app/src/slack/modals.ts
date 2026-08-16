@@ -134,7 +134,7 @@ export interface NewAgentModel {
 }
 
 /**
- * The `/herd new` modal.
+ * The New agent modal, opened from the Home tab's ＋ New agent button.
  *
  * A skeleton is opened first and this replaces it via views.update, because
  * trigger_id expires in about three seconds and fetching workspaces and
