@@ -123,7 +123,7 @@ jobs:
       - name: gitleaks over full history
         run: /tmp/gitleaks git --no-banner --redact
 
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Pinned so CI and local runs agree. Rule definitions change between
