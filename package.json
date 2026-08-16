@@ -27,7 +27,7 @@
     "prepare:dev": "lefthook install"
   },
   "dependencies": {
-    "@slack/bolt": "^4.2.0",
+    "@slack/bolt": "^5.0.0",
     "@types/node": "^26.2.0",
     "@types/proper-lockfile": "^4.1.4",
     "proper-lockfile": "^4.1.2",
