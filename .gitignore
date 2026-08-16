@@ -14,5 +14,5 @@ coverage/
 node_modules/
 *.tsbuildinfo
 
-# os
-.DS_Store
+# Internal design docs — kept locally, not shipped in the public repo
+/docs/

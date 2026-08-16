@@ -1,0 +1,192 @@
+import { EventEmitter } from "node:events";
+import net from "node:net";
+import type { HerdrClient } from "./client.js";
+import type { SessionState } from "./state.js";
+import { type EventEnvelope, GLOBAL_SUBSCRIPTIONS } from "./types.js";
+
+/** Full reconcile cadence — a safety net against a missed or malformed event. */
+const RECONCILE_INTERVAL_MS = 30_000;
+const BACKOFF_MIN_MS = 500;
+const BACKOFF_MAX_MS = 30_000;
+
+export type TailStatus = "connecting" | "connected" | "waiting";
+
+export interface EventTailEvents {
+  status: [{ status: TailStatus; attempt: number; error?: string }];
+  /** Emitted once per successful connect, after the replay has been applied. */
+  ready: [];
+}
+
+/**
+ * Long-lived `events.subscribe` connection feeding a SessionState.
+ *
+ * A missing herdr socket is not fatal: herdr may simply not be running yet (the
+ * daemon outlives it — ADR 0002). We back off, report `waiting`, and keep trying
+ * forever so Slack can still explain *why* the herd looks empty.
+ */
+export class EventTail extends EventEmitter<EventTailEvents> {
+  #socket: net.Socket | null = null;
+  #reconnectTimer: NodeJS.Timeout | null = null;
+  #reconcileTimer: NodeJS.Timeout | null = null;
+  #attempt = 0;
+  #stopped = false;
+  #status: TailStatus = "connecting";
+
+  constructor(
+    private readonly client: HerdrClient,
+    private readonly state: SessionState,
+  ) {
+    super();
+  }
+
+  get status(): TailStatus {
+    return this.#status;
+  }
+
+  start(): void {
+    this.#stopped = false;
+    this.#connect();
+    this.#reconcileTimer = setInterval(() => {
+      void this.reconcile();
+    }, RECONCILE_INTERVAL_MS);
+    this.#reconcileTimer.unref?.();
+  }
+
+  stop(): void {
+    this.#stopped = true;
+    if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
+    if (this.#reconcileTimer) clearInterval(this.#reconcileTimer);
+    this.#reconnectTimer = null;
+    this.#reconcileTimer = null;
+    this.#socket?.destroy();
+    this.#socket = null;
+  }
+
+  /** Pull a full snapshot and overwrite the projection. */
+  async reconcile(): Promise<boolean> {
+    try {
+      const snapshot = await this.client.snapshot();
+      this.state.applySnapshot(snapshot);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  #setStatus(status: TailStatus, error?: string): void {
+    this.#status = status;
+    this.emit("status", {
+      status,
+      attempt: this.#attempt,
+      ...(error === undefined ? {} : { error }),
+    });
+  }
+
+  #connect(): void {
+    if (this.#stopped) return;
+    this.#setStatus("connecting");
+
+    const socket = net.createConnection(this.client.socketPath);
+    this.#socket = socket;
+    let buffer = "";
+
+    socket.on("connect", () => {
+      this.#attempt = 0;
+      socket.write(
+        `${JSON.stringify({
+          id: "sub_1",
+          method: "events.subscribe",
+          params: { subscriptions: GLOBAL_SUBSCRIPTIONS },
+        })}\n`,
+      );
+      this.#setStatus("connected");
+    });
+
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      let newline = buffer.indexOf("\n");
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (line) this.#handleLine(line);
+        newline = buffer.indexOf("\n");
+      }
+    });
+
+    const restart = (reason: string) => {
+      if (this.#socket !== socket) return;
+      this.#socket = null;
+      socket.destroy();
+      this.#scheduleReconnect(reason);
+    };
+
+    socket.on("error", (error) => restart(error.message));
+    socket.on("close", () => restart("connection closed"));
+  }
+
+  #handleLine(line: string): void {
+    let message: unknown;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return; // A malformed frame is survivable; the 30s reconcile repairs drift.
+    }
+    if (typeof message !== "object" || message === null) return;
+
+    const record = message as Record<string, unknown>;
+
+    // The subscribe ack. Verified against a live herdr 0.8.0: this arrives
+    // BEFORE the replay of existing entities, not after — so it says nothing
+    // about whether we have seen current state yet, and priming on it would
+    // announce every already-running agent as a fresh transition.
+    const result = record.result as { type?: string } | undefined;
+    if (result?.type === "subscription_started") {
+      void this.#prime();
+      return;
+    }
+    if (record.error) return;
+
+    const envelope = message as Partial<EventEnvelope>;
+    if (envelope.data && typeof envelope.data === "object") {
+      this.state.apply(envelope.data);
+    }
+  }
+
+  /**
+   * Establish the silent baseline, then start announcing transitions.
+   *
+   * Deliberately driven by an explicit `session.snapshot` rather than by
+   * counting replay frames: the ack ordering above means there is no frame that
+   * reliably marks "you have now seen everything", and a heuristic there fails
+   * as a notification storm. The snapshot is authoritative and also fills in
+   * workspace/tab labels the replay may not resend.
+   *
+   * Events landing while the snapshot is in flight are applied pre-primed (so
+   * silent) and then overwritten by it.
+   */
+  async #prime(): Promise<void> {
+    // Reconnect replays subscription_started too. Without unpriming first, a
+    // snapshot that catches up to idle would announce working→idle for every
+    // agent that was still marked working when the socket dropped.
+    this.state.markUnprimed();
+    await this.reconcile();
+    this.state.markPrimed();
+    this.emit("ready");
+  }
+
+  #scheduleReconnect(reason: string): void {
+    if (this.#stopped || this.#reconnectTimer) return;
+    this.#attempt += 1;
+    this.#setStatus("waiting", reason);
+
+    // Exponential backoff with jitter, capped — herdr may be down for hours.
+    const base = Math.min(BACKOFF_MIN_MS * 2 ** (this.#attempt - 1), BACKOFF_MAX_MS);
+    const delay = base / 2 + Math.random() * (base / 2);
+
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      this.#connect();
+    }, delay);
+    this.#reconnectTimer.unref?.();
+  }
+}

@@ -1,0 +1,193 @@
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  type ConfigError,
+  defaultInstance,
+  readConfigFile,
+  resolveInstance,
+  validateInstance,
+  withCredentials,
+} from "../config/config.js";
+import { stateDir } from "../config/instance.js";
+import { detectSecretStore } from "../config/secrets.js";
+import { HerdrClient, defaultSocketPath, sessionSocketPath } from "../herdr/client.js";
+import { EventTail } from "../herdr/events.js";
+import { SessionState } from "../herdr/state.js";
+import { SessionRegistry } from "../registry/registry.js";
+import { DryRunTransport, formatWrite } from "../slack/dry-run-transport.js";
+import { SocketModeTransport } from "../slack/socket-transport.js";
+import { Surfaces } from "../slack/surfaces.js";
+import type { SlackTransport } from "../slack/transport.js";
+import { RateBudget } from "./budget.js";
+import { Logger } from "./logger.js";
+import { acquireLock, onShutdown, writeRecord } from "./supervisor.js";
+
+const VERSION = "0.1.0";
+
+/** Dry-run fallback only — daemon reads absolute path from config (ADR 0002). */
+function guessSocketPath(instance: string): string {
+  return instance.startsWith("sess-")
+    ? sessionSocketPath(instance.slice("sess-".length))
+    : defaultSocketPath();
+}
+
+export interface RunOptions {
+  dryRun?: boolean;
+}
+
+async function loadConfig(
+  instance: string,
+  dryRun: boolean,
+  log: Logger,
+): Promise<ReturnType<typeof resolveInstance> | null> {
+  try {
+    const store = await detectSecretStore();
+    return await withCredentials(instance, resolveInstance(readConfigFile(), instance), store);
+  } catch (error) {
+    const e = error as ConfigError;
+    if (!dryRun) {
+      log.error("config.invalid", { message: e.message, ...(e.fix ? { fix: e.fix } : {}) });
+      process.stderr.write(`${e.message}\n${e.fix ? `  fix: ${e.fix}\n` : ""}`);
+      return null;
+    }
+    process.stdout.write(`no usable config (${e.message}); dry run continues with defaults\n`);
+    return defaultInstance({ herdrSocketPath: guessSocketPath(instance) });
+  }
+}
+
+function checkStartable(
+  config: ReturnType<typeof resolveInstance>,
+  dryRun: boolean,
+  log: Logger,
+): boolean {
+  const problems = validateInstance(config);
+  for (const problem of problems) {
+    log.error("daemon.refused", { problem, dryRun });
+    process.stderr.write(
+      `${dryRun ? "not configured for a real start" : "refusing to start"}: ${problem}\n`,
+    );
+  }
+  if (problems.length === 0 || dryRun) return true;
+  process.stderr.write("run: herdr-slack doctor\n");
+  return false;
+}
+
+/**
+ * Dry run redirects state to a scratch dir — otherwise it takes the real lock,
+ * overwrites daemon.json, and persists synthetic dry-ts-* thread timestamps.
+ */
+export function redirectStateToScratch(): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "herdr-slack-dry-"));
+  process.env.HERDR_PLUGIN_STATE_DIR = dir;
+  return dir;
+}
+
+export async function runDaemon(instance: string, options: RunOptions = {}): Promise<number> {
+  const dryRun = options.dryRun === true;
+  const log = new Logger(instance);
+  const scratch = dryRun ? redirectStateToScratch() : null;
+  if (scratch) {
+    process.stdout.write(`dry run: nothing is sent to Slack; state is scoped to ${scratch}
+any problems below are what a real start would refuse on — this run continues past them\n\n`);
+  }
+  const release = await acquireLock(instance);
+  if (!release) {
+    log.event("daemon.lock_held", { instance });
+    return 0;
+  }
+
+  const config = await loadConfig(instance, dryRun, log);
+  if (!config || !checkStartable(config, dryRun, log)) {
+    await release();
+    return 1;
+  }
+
+  mkdirSync(stateDir(instance), { recursive: true, mode: 0o700 });
+  writeRecord({
+    pid: process.pid,
+    instance,
+    socketPath: config.herdrSocketPath,
+    startedAt: new Date().toISOString(),
+    version: VERSION,
+    slackTeamId: config.slack.teamId,
+  });
+
+  const client = new HerdrClient(config.herdrSocketPath);
+  const state = new SessionState();
+  const tail = new EventTail(client, state);
+  const budget = new RateBudget({ totalPerMin: config.rateBudgetPerMin });
+
+  tail.on("status", ({ status, error }) => {
+    log.event("herdr.status", { status, ...(error ? { error } : {}) });
+  });
+  state.on("transition", (t) => {
+    log.event("agent.transition", { terminalId: t.terminalId, from: t.from ?? null, to: t.to });
+  });
+
+  const registry = new SessionRegistry(instance);
+  const transport: SlackTransport = dryRun
+    ? new DryRunTransport((write) => {
+        log.event("slack.dry_run", { api: write.api, target: write.target, bytes: write.bytes });
+        process.stdout.write(`${formatWrite(write)}\n`);
+      })
+    : new SocketModeTransport(config, (line) => log.event("surface", { msg: line }));
+  const surfaces = new Surfaces({
+    config,
+    instance,
+    transport,
+    state,
+    tail,
+    registry,
+    budget,
+    client,
+    log: (line) => log.line(line),
+  });
+
+  surfaces.start();
+  tail.start();
+
+  try {
+    await transport.start();
+  } catch (error) {
+    log.error("slack.connect_failed", { message: (error as Error).message });
+    process.stderr.write(`could not connect to Slack: ${(error as Error).message}\n`);
+    process.stderr.write("run: herdr-slack doctor\n");
+    tail.stop();
+    state.dispose();
+    await release();
+    return 1;
+  }
+
+  log.event("daemon.up", {
+    dryRun,
+    pid: process.pid,
+    version: VERSION,
+    socketPath: config.herdrSocketPath,
+    budgetPerMin: budget.totalPerMin,
+    contentMode: config.contentMode,
+  });
+
+  if (dryRun) {
+    setTimeout(() => {
+      const audience = config.allowedUsers.length > 0 ? config.allowedUsers : ["U_DRYRUN"];
+      for (const userId of audience) void surfaces.publishHome(userId);
+      setTimeout(() => {
+        process.stdout.write("\nwatching for changes — ^C to stop\n");
+      }, 500).unref?.();
+    }, 1_500).unref?.();
+  }
+
+  onShutdown(async () => {
+    log.event("daemon.shutdown");
+    if (scratch) rmSync(scratch, { recursive: true, force: true });
+    surfaces.stop();
+    tail.stop();
+    state.dispose();
+    await transport.stop();
+    await release();
+  });
+
+  await new Promise<void>(() => undefined);
+  return 0;
+}

@@ -1,0 +1,40 @@
+# gitleaks configuration.
+#
+# Extends the default ruleset rather than replacing it — we want every rule
+# gitleaks ships, plus a narrow allowance for the synthetic credentials the
+# redaction tests need.
+[extend]
+useDefault = true
+
+# ── Synthetic test credentials ───────────────────────────────────────────────
+#
+# redact.ts matches on prefix, charset and length, so its fixtures have to be
+# shaped like real credentials to test anything. They do NOT have to look
+# plausible.
+#
+# The convention: every synthetic credential contains the literal EXAMPLE.
+# The allowlist below requires BOTH the credential shape AND that marker, so a
+# real `sk-9f2c…` is still caught while `sk-EXAMPLE…` is not. That is
+# deliberately narrower than allowlisting the test directory — a fixture file is
+# exactly where a real credential gets committed by accident, and blinding the
+# scanner there would defeat the point of running it.
+[[allowlists]]
+description = "Synthetic credentials containing the EXAMPLE marker"
+regexTarget = "match"
+regexes = [
+  '''sk-EXAMPLE[A-Za-z0-9_-]*''',
+  '''sk-ant-EXAMPLE[A-Za-z0-9_-]*''',
+  '''xox[baprs]-EXAMPLE[A-Za-z0-9-]*''',
+  '''xapp-[0-9]-EXAMPLE[A-Za-z0-9-]*''',
+  '''gh[pousr]_EXAMPLE[A-Za-z0-9]*''',
+  '''github_pat_EXAMPLE[A-Za-z0-9_]*''',
+  '''(AKIA|ASIA)EXAMPLE[A-Z0-9]*''',
+  '''AIzaEXAMPLE[A-Za-z0-9_-]*''',
+  '''[sr]k_(live|test)_EXAMPLE[A-Za-z0-9]*''',
+  '''npm_EXAMPLE[A-Za-z0-9]*''',
+  # The PEM rule's match spans the whole block, so the marker inside it is
+  # visible to the allowlist — no path exception needed.
+  '''-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*EXAMPLEnotarealkey[\s\S]*''',
+  # KEY=value fixtures for the assignment rule.
+  '''EXAMPLE_NOT_A_REAL_[A-Za-z0-9_]*''',
+]

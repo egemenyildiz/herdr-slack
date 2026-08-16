@@ -1,0 +1,33 @@
+# Contributor-only hooks. Lefthook's own npm postinstall wires these up when you
+# run `npm install`; `npm run prepare:dev` re-installs them explicitly if the
+# hooks are ever lost.
+#
+# What keeps this off end-user machines is NOT the absence of a `prepare` script
+# (lefthook self-installs regardless) — it is that `herdr plugin install` runs
+# `npm ci --omit=dev`, which excludes lefthook entirely and writes no hooks into
+# the herdr-managed checkout. CI's `install-path` job proves that every push.
+# Do not add a root `prepare` script: that WOULD run on --omit=dev installs.
+
+pre-commit:
+  parallel: true
+  commands:
+    format:
+      glob: "*.{ts,js,json,jsonc}"
+      run: npx biome check --write --no-errors-on-unmatched {staged_files}
+      stage_fixed: true
+    typecheck:
+      glob: "*.ts"
+      run: npm run typecheck
+    secrets:
+      run: |
+        if command -v gitleaks >/dev/null 2>&1; then
+          gitleaks protect --staged --redact --verbose
+        else
+          echo "gitleaks not installed — skipping local scan (CI still enforces it)"
+          echo "install: brew install gitleaks"
+        fi
+
+pre-push:
+  commands:
+    test:
+      run: npm run test

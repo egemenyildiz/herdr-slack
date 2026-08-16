@@ -1,0 +1,25 @@
+# Agent launch modes for herdr-slack.
+#
+# Copy to your config dir (herdr-slack doctor prints the path) and edit.
+#
+# Only kinds listed here get mode choices in `/herd new`; every other kind
+# starts with its own defaults. Add a kind once you have verified its flags
+# actually work — a mode that fails at launch is worse than no mode.
+
+[claude]
+label = "Claude Code"
+modes = [
+  { id = "default",      label = "Default",            args = [] },
+  { id = "plan",         label = "Plan mode",          args = ["--permission-mode", "plan"] },
+  # Claude's auto mode — the "auto-accept edits" state shift+tab cycles to.
+  # This is what Slack launches in; there is no separate "auto" flag.
+  { id = "accept-edits", label = "Auto (accept edits)", args = ["--permission-mode", "acceptEdits"] },
+  { id = "yolo",         label = "Skip permissions ⚠", args = ["--dangerously-skip-permissions"] },
+]
+
+[codex]
+label = "Codex"
+modes = [
+  { id = "default",   label = "Default",   args = [] },
+  { id = "full-auto", label = "Full auto", args = ["--full-auto"] },
+]
