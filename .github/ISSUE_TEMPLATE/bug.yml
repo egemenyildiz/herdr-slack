@@ -1,0 +1,43 @@
+name: Bug report
+description: Something behaves incorrectly once set up
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste tokens, terminal output containing secrets, or your config file.**
+        If a bug involves terminal content, reproduce it with a harmless command first.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what you got.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the session thread for a blocked claude agent
+        2. Tap option 2
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: "herdr-slack 0.1.0 · herdr 0.8.0 · node 26.0.0 · macOS 15.5"
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent kind and mode (if relevant)
+      placeholder: "claude, plan mode"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant lines from `herdr-slack daemon logs`
+      render: text

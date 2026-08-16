@@ -1,0 +1,132 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    # Both platforms the manifest declares, and both ends of the supported
+    # Node range (engines: >=22; 22 is supported until Apr 2027).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: [22, 26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:coverage
+
+  # The path a real user takes: `herdr plugin install` clones and runs
+  # `npm ci --omit=dev && npm run build`. Dev tooling must not be required.
+  install-path:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      - name: Build with production dependencies only
+        run: |
+          npm ci --omit=dev
+          npm run build
+          # Assert the build actually emitted something, rather than naming a
+          # specific entrypoint — the artifact set grows milestone by milestone,
+          # and a check that fails until M1 teaches everyone to ignore red CI.
+          test -d app/dist && [ -n "$(ls -A app/dist)" ]
+      - name: Assert dev tooling is absent from a production install
+        run: |
+          for pkg in lefthook vitest @biomejs/biome; do
+            if [ -e "node_modules/$pkg" ]; then
+              echo "::error::$pkg present after --omit=dev; dev tooling is leaking to users"
+              exit 1
+            fi
+          done
+          # A `prepare` script would run on --omit=dev installs and write git hooks
+          # into the herdr-managed checkout. See CONTRIBUTING.md.
+          if node -e "process.exit(require('./package.json').scripts.prepare?0:1)"; then
+            echo "::error::package.json has a 'prepare' script; it will run on user installs"
+            exit 1
+          fi
+
+  secrets:
+    runs-on: ubuntu-latest
+    # gitleaks-action enumerates PR commits, which needs pull-requests: read on
+    # top of the workflow-level contents: read.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # An allowlist that over-matches fails silently, which is worse than no
+      # allowlist. Plant credentials the default rules definitely detect and
+      # assert they are still caught with our config in place.
+      #
+      # Runs entirely in a temp dir: downloading the scanner into the workspace
+      # would leave a 5MB binary for the next step to scan, which finds strings
+      # inside it and fails for reasons having nothing to do with this repo.
+      - name: Assert the allowlist has not gone blind
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          cp .gitleaks.toml "$work/"
+          mkdir -p "$work/app/test/helpers"
+          cp app/test/helpers/fake-credentials.ts "$work/app/test/helpers/"
+          # Assembled from fragments rather than written out. These strings must
+          # remain *detectable* to be worth anything, so unlike the test fixtures
+          # they cannot carry a marker or be allowlisted — writing them whole
+          # would just make this file fail the very scan it is guarding.
+          {
+            printf 'const a = "sk_%s_%s";\n' "live" "51H8xKqLmNpQrStUvWxYz0123"
+            printf 'const b = "gh%s_%s";\n' "p" "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+            printf 'const c = "xo%s-%s-%s-%s";\n' "xb" "123456789012" "987654321098" "AbCdEfGhIjKlMnOpQrStUvWx"
+          } > "$work/app/test/helpers/canary.ts"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz" \
+            | tar -xz -C /tmp gitleaks
+          if (cd "$work" && /tmp/gitleaks detect --no-git --no-banner --redact); then
+            echo "::error::planted credentials were not flagged — the allowlist is too broad"
+            exit 1
+          fi
+          echo "allowlist is narrow: planted credentials were detected"
+
+      # The action below scans the commits in a push or PR. This scans every
+      # commit ever made — a secret is only removed from history by rewriting it,
+      # and the later we learn, the worse that is. fetch-depth: 0 above enables it.
+      - name: gitleaks over full history
+        run: /tmp/gitleaks git --no-banner --redact
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pinned so CI and local runs agree. Rule definitions change between
+          # versions, and a fixture that passes locally then fails here is a
+          # confusing way to learn that.
+          GITLEAKS_VERSION: "8.28.0"

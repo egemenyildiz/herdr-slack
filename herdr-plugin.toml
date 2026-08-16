@@ -1,0 +1,87 @@
+id = "herdr-slack"
+name = "herdr-slack"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Drive your local herdr agents from Slack — browse, prompt, approve, and launch from your phone. No tunnel, no relay."
+platforms = ["linux", "macos"]
+
+# --omit=dev on purpose: the dev toolchain must not land on a user's machine.
+# `typescript` and `@types/node` are runtime dependencies for exactly this
+# reason, and CI's install-path job proves this command works on a clean clone.
+[[build]]
+command = ["npm", "ci", "--omit=dev"]
+[[build]]
+command = ["npm", "run", "build"]
+
+# Idempotent, exits in well under 100ms, and never holds the daemon lock — it
+# spawns `daemon run`, which takes it. Losers exit 0 quietly, which is what
+# makes two concurrent starts benign. The daemon proper is a launchd/systemd
+# user service so it outlives herdr; this hook only covers people who declined
+# that during setup.
+[[startup]]
+command = ["node", "app/dist/cli.js", "daemon", "ensure"]
+
+# Open the setup popup when this instance still needs configuring. Separate
+# from ensure so the daemon path stays fast and non-interactive (ADR 0008).
+# Does not run on plugin install — only on session restore / server handoff.
+[[startup]]
+command = ["node", "app/dist/cli.js", "setup", "--offer"]
+
+# Interactive wizard (or continue/reset menu). Placement is declared here —
+# this herdr build's CLI --placement enum omits popup, so openers must not
+# override it.
+[[panes]]
+id = "setup"
+title = "herdr-slack setup"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["node", "app/dist/cli.js", "setup", "--pane"]
+
+# Destructive reset output stays visible until the user presses Enter.
+[[panes]]
+id = "reset"
+title = "herdr-slack reset"
+placement = "popup"
+width = "80%"
+height = "70%"
+command = ["node", "app/dist/cli.js", "reset", "--yes", "--pane"]
+
+# A log viewer, not the bridge. Closing this pane must not stop anything.
+[[panes]]
+id = "console"
+title = "herdr-slack"
+placement = "split"
+command = ["node", "app/dist/cli.js", "daemon", "logs", "-f"]
+
+# Manual path when install happened while herdr was already running (startup
+# does not fire on install/link/enable).
+[[actions]]
+id = "setup"
+title = "herdr-slack: setup"
+contexts = ["workspace"]
+command = ["node", "app/dist/cli.js", "setup", "--open"]
+
+[[actions]]
+id = "reset"
+title = "herdr-slack: reset local setup"
+contexts = ["workspace"]
+command = ["node", "app/dist/cli.js", "reset", "--open"]
+
+[[actions]]
+id = "status"
+title = "herdr-slack: status"
+contexts = ["workspace"]
+command = ["node", "app/dist/cli.js", "daemon", "status"]
+
+[[actions]]
+id = "doctor"
+title = "herdr-slack: doctor"
+contexts = ["workspace"]
+command = ["node", "app/dist/cli.js", "doctor"]
+
+[[actions]]
+id = "restart"
+title = "herdr-slack: restart daemon"
+contexts = ["workspace"]
+command = ["node", "app/dist/cli.js", "daemon", "restart"]

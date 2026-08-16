@@ -1,0 +1,303 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { defaultInstance } from "../../src/config/config.js";
+import { RateBudget } from "../../src/daemon/budget.js";
+import { HerdrClient } from "../../src/herdr/client.js";
+import { EventTail } from "../../src/herdr/events.js";
+import { SessionState } from "../../src/herdr/state.js";
+import { SessionRegistry } from "../../src/registry/registry.js";
+import { ACTION_IDS, BLOCK_IDS, MODAL_IDS } from "../../src/slack/modals.js";
+import { Surfaces } from "../../src/slack/surfaces.js";
+import { pane, workspace } from "../helpers/factories.js";
+import { FakeHerdr } from "../helpers/fake-herdr.js";
+import { FakeTransport } from "../helpers/fake-transport.js";
+
+/** Everything the bot said, whether posted or shown only to the user. */
+const said = (transport: FakeTransport): string =>
+  [...transport.posted.map((p) => p.text), ...transport.ephemerals.map((e) => e.text)].join("\n");
+
+const ctx = (overrides = {}) => ({ teamId: "T1", userId: "U1", channel: "D1", ...overrides });
+
+const submission = (values: Record<string, unknown>) => ({
+  values: {
+    [BLOCK_IDS.kind]: { [ACTION_IDS.kind]: { selected_option: { value: "claude" } } },
+    [BLOCK_IDS.mode]: { [ACTION_IDS.mode]: { selected_option: { value: "plan" } } },
+    ...values,
+  },
+});
+
+describe("Surfaces commands and launching", () => {
+  let dir: string;
+  let fake: FakeHerdr;
+  let transport: FakeTransport;
+  let state: SessionState;
+  let surfaces: Surfaces;
+  let tail: EventTail;
+  let logs: string[];
+
+  const settle = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), "hs-cmd-"));
+    process.env.HERDR_PLUGIN_STATE_DIR = dir;
+    process.env.HERDR_PLUGIN_CONFIG_DIR = path.join(dir, "cfg");
+    logs = [];
+    fake = await FakeHerdr.start();
+    transport = new FakeTransport();
+    state = new SessionState();
+    state.markPrimed();
+    tail = new EventTail(new HerdrClient(fake.socketPath, 500), state);
+    tail.start();
+    await settle();
+
+    surfaces = new Surfaces({
+      config: defaultInstance({
+        label: "personal",
+        slack: {
+          botToken: "xoxb-1",
+          appToken: "xapp-1",
+          teamId: "T1",
+          appId: "A1",
+          botUserId: "UBOT",
+        },
+        allowedUsers: ["U1"],
+      }),
+      instance: "default",
+      transport,
+      state,
+      tail,
+      registry: new SessionRegistry("default"),
+      client: new HerdrClient(fake.socketPath, 1_000),
+      budget: new RateBudget({ totalPerMin: 200 }),
+      ackTimeoutMs: 20,
+      log: (line) => logs.push(line),
+    });
+    surfaces.start();
+  });
+
+  afterEach(async () => {
+    surfaces.stop();
+    tail.stop();
+    state.dispose();
+    await fake.stop();
+    rmSync(dir, { recursive: true, force: true });
+    delete process.env.HERDR_PLUGIN_STATE_DIR;
+    delete process.env.HERDR_PLUGIN_CONFIG_DIR;
+  });
+
+  describe("/herd new", () => {
+    it("opens a skeleton before calling herdr, then fills it in", async () => {
+      // trigger_id expires in ~3s; fetching first would routinely miss it.
+      fake.on("workspace.list", () => ({ workspaces: [workspace()] }));
+      fake.on("worktree.list", () => ({ worktrees: [] }));
+
+      await transport.emitCommand({ ctx: ctx(), text: "new", triggerId: "trig1" });
+
+      expect(transport.modals).toHaveLength(1);
+      expect(JSON.stringify(transport.modals[0]?.view)).toContain("Loading");
+      expect(transport.modalUpdates).toHaveLength(1);
+      expect(JSON.stringify(transport.modalUpdates[0]?.view)).toContain(BLOCK_IDS.kind);
+    });
+
+    it("still opens the modal when herdr cannot list workspaces", async () => {
+      // No handlers registered → unknown_method. The form should degrade, not
+      // leave the user with a spinner.
+      await transport.emitCommand({ ctx: ctx(), text: "new", triggerId: "trig1" });
+      expect(transport.modalUpdates).toHaveLength(1);
+    });
+
+    it("ignores a command from someone not on the allowlist", async () => {
+      await transport.emitCommand({
+        ctx: ctx({ userId: "U_OTHER" }),
+        text: "new",
+        triggerId: "t",
+      });
+      expect(transport.modals).toEqual([]);
+      expect(logs.join()).toContain("not_allowed");
+    });
+  });
+
+  describe("/herd", () => {
+    it("shows the herd for a bare command", async () => {
+      await transport.emitCommand({ ctx: ctx(), text: "", triggerId: "t" });
+      expect(transport.homes.length).toBeGreaterThan(0);
+    });
+
+    it("opens a session by exact title match", async () => {
+      state.apply({ type: "workspace_created", workspace: workspace() });
+      state.apply({
+        type: "pane_created",
+        pane: pane({ terminal_id: "term_1", terminal_title_stripped: "fix auth redirect" }),
+      });
+      surfaces.reconcileSessions();
+      fake.on("pane.read", () => ({ read: { text: "output" } }));
+
+      await transport.emitCommand({ ctx: ctx(), text: "fix auth redirect", triggerId: "t" });
+
+      expect(said(transport)).toContain("claude");
+    });
+
+    it("refuses a partial title match", async () => {
+      state.apply({ type: "workspace_created", workspace: workspace() });
+      state.apply({
+        type: "pane_created",
+        pane: pane({ terminal_id: "term_1", terminal_title_stripped: "fix auth redirect" }),
+      });
+      surfaces.reconcileSessions();
+
+      await transport.emitCommand({ ctx: ctx(), text: "auth", triggerId: "t" });
+
+      expect(said(transport)).toContain("No agent matching");
+    });
+
+    it("refuses an ambiguous agent query", async () => {
+      state.apply({ type: "workspace_created", workspace: workspace() });
+      state.apply({
+        type: "pane_created",
+        pane: pane({ terminal_id: "term_1", agent: "claude", terminal_title_stripped: "task a" }),
+      });
+      state.apply({
+        type: "pane_created",
+        pane: pane({ terminal_id: "term_2", agent: "claude", terminal_title_stripped: "task b" }),
+      });
+      surfaces.reconcileSessions();
+
+      await transport.emitCommand({ ctx: ctx(), text: "claude", triggerId: "t" });
+
+      expect(said(transport)).toContain("more than one agent");
+    });
+
+    it("says so when nothing matches, rather than opening the wrong agent", async () => {
+      await transport.emitCommand({ ctx: ctx(), text: "nonexistent", triggerId: "t" });
+      expect(said(transport)).toContain("No agent matching");
+    });
+  });
+
+  describe("launching from the modal", () => {
+    const wireLaunch = () => {
+      fake.on("tab.create", () => ({
+        tab: { tab_id: "w1:t9" },
+        root_pane: { pane_id: "w1:p9" },
+      }));
+      fake.on("pane.process_info", () => ({ process: { foreground_command: null } }));
+      fake.on("agent.start", () => ({ ok: true }));
+      // herdr has to report the agent registered before the first prompt is
+      // sent; without this the launcher waits out its readiness window.
+      fake.on("agent.get", () => ({ agent: { agent: "claude" } }));
+      fake.on("agent.prompt", () => ({ ok: true }));
+    };
+
+    it("creates the tab, starts the agent, and sends the first prompt", async () => {
+      wireLaunch();
+
+      await transport.emitViewSubmit({
+        ctx: ctx(),
+        callbackId: MODAL_IDS.newAgent,
+        view: submission({
+          [BLOCK_IDS.directoryOther]: { [ACTION_IDS.directoryOther]: { value: "/work/app" } },
+          [BLOCK_IDS.prompt]: { [ACTION_IDS.prompt]: { value: "start here" } },
+        }),
+      });
+
+      expect(fake.requests.find((r) => r.method === "tab.create")?.params).toMatchObject({
+        cwd: "/work/app",
+        focus: false,
+      });
+      expect(fake.requests.find((r) => r.method === "agent.start")?.params).toMatchObject({
+        kind: "claude",
+        args: ["--permission-mode", "acceptEdits"],
+      });
+      expect(fake.requests.find((r) => r.method === "agent.prompt")?.params).toMatchObject({
+        text: "start here",
+      });
+    });
+
+    it("reports a launch failure in words", async () => {
+      fake.on("tab.create", () => new Error("no such workspace"));
+
+      await transport.emitViewSubmit({
+        ctx: ctx(),
+        callbackId: MODAL_IDS.newAgent,
+        view: submission({}),
+      });
+
+      const words = said(transport);
+      expect(words).toContain("Could not start claude");
+      expect(words).not.toContain("Error:");
+    });
+
+    it("always launches in auto mode, whatever the form said", async () => {
+      // Nobody is at the terminal to answer a permission prompt when the
+      // launch came from a phone, so an agent that stops to ask has stalled
+      // until someone opens the thread.
+      wireLaunch();
+
+      await transport.emitViewSubmit({
+        ctx: ctx(),
+        callbackId: MODAL_IDS.newAgent,
+        view: submission({}),
+      });
+
+      expect(fake.requests.find((r) => r.method === "agent.start")?.params).toMatchObject({
+        kind: "claude",
+        args: ["--permission-mode", "acceptEdits"],
+      });
+    });
+
+    it("remembers the choices for the next form", async () => {
+      wireLaunch();
+
+      await transport.emitViewSubmit({
+        ctx: ctx(),
+        callbackId: MODAL_IDS.newAgent,
+        view: submission({
+          [BLOCK_IDS.directoryOther]: { [ACTION_IDS.directoryOther]: { value: "/work/app" } },
+        }),
+      });
+
+      const { readLastLaunch } = await import("../../src/agents/last-launch.js");
+      expect(readLastLaunch("default")).toMatchObject({ kind: "claude", cwd: "/work/app" });
+    });
+
+    it("ignores a submission from someone not on the allowlist", async () => {
+      wireLaunch();
+
+      await transport.emitViewSubmit({
+        ctx: ctx({ userId: "U_OTHER" }),
+        callbackId: MODAL_IDS.newAgent,
+        view: submission({}),
+      });
+
+      expect(fake.requests.some((r) => r.method === "tab.create")).toBe(false);
+    });
+
+    it("ignores a submission for a different modal", async () => {
+      wireLaunch();
+      await transport.emitViewSubmit({
+        ctx: ctx(),
+        callbackId: "some_other_modal",
+        view: submission({}),
+      });
+      expect(fake.requests.some((r) => r.method === "tab.create")).toBe(false);
+    });
+
+    it("derives an agent name herdr will accept from the tab label", async () => {
+      wireLaunch();
+
+      await transport.emitViewSubmit({
+        ctx: ctx(),
+        callbackId: MODAL_IDS.newAgent,
+        view: submission({
+          [BLOCK_IDS.label]: { [ACTION_IDS.label]: { value: "Fix Auth Redirect!" } },
+        }),
+      });
+
+      const name = (
+        fake.requests.find((r) => r.method === "agent.start")?.params as { name: string }
+      ).name;
+      expect(name).toMatch(/^[a-z][a-z0-9_-]{0,31}$/);
+    });
+  });
+});

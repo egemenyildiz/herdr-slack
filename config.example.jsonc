@@ -1,0 +1,42 @@
+// Written by `herdr-slack setup`; shown here so the shape is reviewable.
+// The real file lives in your config dir at mode 0600 and is gitignored.
+//
+// When a keychain is available, botToken and appToken are EMPTY here and the
+// credentials live in the OS keychain instead — credentialStore says which.
+{
+  "version": 1,
+  "instances": {
+    "default": {
+      "label": "personal",
+      "credentialStore": "keychain",
+
+      // Absolute. The daemon reads this rather than HERDR_SOCKET_PATH, because
+      // under launchd/systemd there is no herdr environment at all.
+      "herdrSocketPath": "/Users/you/.config/herdr/herdr.sock",
+
+      "slack": {
+        "botToken": "",
+        "appToken": "",
+        "teamId": "T0123456789", // pinned; payloads from elsewhere are refused
+        "appId": "A0123456789",
+        "botUserId": "U0123456789"
+      },
+
+      // Non-empty or the daemon refuses to start. Anyone listed here can type
+      // into your terminals.
+      "allowedUsers": ["U0123456789"],
+
+      "dmOnly": true,
+
+      // full | summary | titles. Default is `full` so session cards show
+      // extracted responses. On a work workspace prefer `summary` — controls
+      // still work, but no free terminal text leaves the machine.
+      "contentMode": "full",
+
+      // Working directories whose panes never render into Slack.
+      "excludePaths": [],
+
+      "rateBudgetPerMin": 18
+    }
+  }
+}

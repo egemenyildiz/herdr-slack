@@ -1,0 +1,50 @@
+name: Setup problem
+description: herdr-slack setup or doctor is failing
+labels: ["setup"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Setup is where most people get stuck, so this form asks for everything needed to
+        diagnose it in one round trip.
+
+        **Do not paste tokens.** `doctor --json` redacts them; if you paste anything else,
+        check it first. If you already pasted a token somewhere, rotate it in your Slack app
+        settings before filing this.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `herdr-slack doctor --json`
+      description: Redacted automatically. This alone usually identifies the problem.
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: step
+    attributes:
+      label: Which setup step failed?
+      placeholder: "e.g. step 5 — app-level token never detected from clipboard"
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: "herdr-slack 0.1.0 · herdr 0.8.0 · node 26.0.0 · macOS 15.5"
+    validations:
+      required: true
+  - type: dropdown
+    id: workspace
+    attributes:
+      label: Slack workspace type
+      options:
+        - Personal / workspace I administer
+        - Work workspace, I can create and install apps
+        - Work workspace, app installs need admin approval
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: detail
+    attributes:
+      label: What did you expect, and what happened instead?

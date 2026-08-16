@@ -1,0 +1,36 @@
+# Documented gitleaks false positives, by fingerprint.
+#
+# Entries must be justified. Do NOT add a blanket rule for app/test/** — a
+# fixture is exactly where a real credential gets committed by accident, and
+# blinding the scanner there defeats the point of running it.
+#
+# Going forward this list should not grow. Synthetic credentials now carry an
+# EXAMPLE marker and are allowlisted by shape+marker in .gitleaks.toml, so a new
+# fixture cannot trip the scanner. The entries below cover commits made before
+# that convention existed.
+#
+# Never quote the offending value in a comment here. gitleaks scans this file
+# too, so reproducing the string turns the explanation into a fresh finding.
+
+# A clipboard test used a fake Slack app token whose shape happened to match the
+# slack-app-token rule. Never a real credential; the fixture was replaced with an
+# obviously-fake value in a later commit. This covers the historical copy.
+878054eccf92258ab6961075794856f5720cafef:app/test/config/clipboard.test.ts:slack-app-token:13
+
+# The commit that first added this file quoted that same fake token in a comment,
+# so the explanation itself became a finding. Fixed immediately after; this
+# covers that one commit.
+16e1dfd6c5a0274ef2b2a9b2286e0b49ad50bc5d:.gitleaksignore:slack-app-token:11
+
+# A redaction test used a literal KEY=value fixture, which is exactly the shape
+# the generic-api-key rule looks for. Never a real credential. The fixtures are
+# now assembled at runtime so the literal no longer appears in the file; this
+# covers the one commit that carried it.
+8f375d3964fe675a69b03d3c7369f026e6448620:app/test/slack/redact.test.ts:generic-api-key:56
+
+# The commit that introduced the CI canary wrote its planted credentials as
+# literals in ci.yml before they were moved to runtime assembly. Deliberately
+# fake, and detectable on purpose — that is the whole point of a canary.
+908636d3efa3068f0a029509514e09f1cdd84d1e:.github/workflows/ci.yml:github-pat:96
+908636d3efa3068f0a029509514e09f1cdd84d1e:.github/workflows/ci.yml:slack-bot-token:97
+908636d3efa3068f0a029509514e09f1cdd84d1e:.github/workflows/ci.yml:stripe-access-token:95

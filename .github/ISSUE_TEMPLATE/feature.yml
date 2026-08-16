@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a capability
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please skim the README and [`SECURITY.md`](../../SECURITY.md).
+        Several popular ideas — a public Request URL, a hosted relay, Marketplace
+        distribution — are deliberate *no*s for this project (outbound Socket Mode
+        only, no hosted broker). Reopening one needs new evidence rather than a
+        new request.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you hitting?
+      description: The situation, not the solution. What were you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This does not require an inbound network listener, tunnel, or hosted backend
+          required: true
+        - label: This isn't already a recorded no (check open issues and the README scope section)
+          required: true
