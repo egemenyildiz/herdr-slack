@@ -1,8 +1,8 @@
 {
   "name": "herdr-slack",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "Drive your local herdr agents from Slack \u2014 browse, prompt, approve, and launch agents from your phone.",
+  "description": "Drive your local herdr agents from Slack — browse, prompt, approve, and launch agents from your phone.",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
