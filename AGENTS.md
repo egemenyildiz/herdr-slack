@@ -34,10 +34,11 @@ Security-sensitive; breaking these is a security bug.
    action time; fail closed when the terminal is gone.
 2. **Block Kit payloads carry only an opaque `ref`.** Never a pane id or terminal id.
 3. **Fail closed** on unknown ref, dead terminal, wrong `team_id`, non-allowlisted user, exhausted
-   throttle.
+   throttle, or **herdr not connected** (Reply / End / Refresh / Earlier / New agent / menu choices).
 4. **Every outbound terminal payload is redacted** (`redact.ts`) before Slack sees it. Extracted
    replies are rendered as mrkdwn sections (`response.ts` → `responseSections`), never raw scrollback.
-5. **No inbound listener.**
+5. **No inbound listener.** Phone control requires the **machine awake** with herdr running — sleep
+   freezes the daemon and Socket Mode; there is no wake-from-Slack path.
 6. **Daemon reads `herdrSocketPath` from config**, not `HERDR_SOCKET_PATH` at runtime (except
    `setup` and `daemon ensure`).
 7. **Secrets never in logs.** No terminal content in `daemon.log` except `--dry-run`.
@@ -56,6 +57,8 @@ Security-sensitive; breaking these is a security bug.
   `chat.update` alone is silent.
 - Shared Slack write budget is a **single** token bucket (`RateBudget`), not separate control/data
   lanes.
+- When herdr is down, cards and Home **omit** interactive controls and refuse those actions — keep
+  the machine awake to drive agents from Slack.
 
 ## Layout
 

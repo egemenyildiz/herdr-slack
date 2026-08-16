@@ -35,6 +35,8 @@ export interface SessionControllerDeps {
   log: (line: string) => void;
   /** Injected so tests need no timers. */
   now?: () => number;
+  /** Live herdr socket; absent means assume connected (unit tests). */
+  isHerdrConnected?: () => boolean;
 }
 
 export interface ActionOutcome {
@@ -82,12 +84,16 @@ export class SessionController {
     // again re-attaches instead of refusing.
     if (record.ended) registry.reopen(terminalId);
     const workspace = state.workspaces.get(pane.workspace_id);
-    const view = viewFromPane(
-      pane,
-      record?.ref ?? "",
-      workspace?.label ?? pane.workspace_id,
-      state.statusOf(terminalId) ?? pane.agent_status,
-    );
+    const herdrConnected = this.deps.isHerdrConnected?.() ?? true;
+    const view = {
+      ...viewFromPane(
+        pane,
+        record.ref,
+        workspace?.label ?? pane.workspace_id,
+        state.statusOf(terminalId) ?? pane.agent_status,
+      ),
+      ...(herdrConnected ? {} : { herdrConnected: false as const }),
+    };
     const card = sessionCard(view, record);
 
     if (record.slackThreadTs && record.slackChannel) {
@@ -362,14 +368,19 @@ export class SessionController {
     if (!record?.slackChannel || !record.slackThreadTs) return;
 
     const status = state.statusOf(terminalId) ?? pane?.agent_status ?? record.lastStatus;
+    const herdrConnected = this.deps.isHerdrConnected?.() ?? true;
+    const offline = herdrConnected ? {} : { herdrConnected: false as const };
     const view: SessionView = pane
-      ? viewFromPane(
-          pane,
-          record.ref,
-          state.workspaces.get(pane.workspace_id)?.label ?? pane.workspace_id,
-          status,
-          record.ended,
-        )
+      ? {
+          ...viewFromPane(
+            pane,
+            record.ref,
+            state.workspaces.get(pane.workspace_id)?.label ?? pane.workspace_id,
+            status,
+            record.ended,
+          ),
+          ...offline,
+        }
       : {
           ended: record.ended,
           ref: record.ref,
@@ -379,10 +390,11 @@ export class SessionController {
           status,
           workspaceLabel: record.workspaceId,
           tabId: record.tabId,
+          ...offline,
         };
 
     let waiting: Record<string, unknown>[] = [];
-    if (!record.ended && pane && status === "blocked") {
+    if (!record.ended && herdrConnected && pane && status === "blocked") {
       const detection = await client.read(pane.pane_id, "detection", 60).catch(() => "");
       const workspace = state.workspaces.get(pane.workspace_id);
       const blockedView = viewFromPane(

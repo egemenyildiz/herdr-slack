@@ -74,6 +74,12 @@ export interface SessionView {
   workspaceLabel: string;
   tabId: string;
   ended?: boolean;
+  /**
+   * When false, omit every interactive control. Block Kit has no disabled
+   * buttons — a read-only banner is the only honest offline surface.
+   * Omitted means connected (tests and ended cards).
+   */
+  herdrConnected?: boolean;
 }
 
 export function sendsTerminalText(mode: ContentMode): boolean {
@@ -171,6 +177,21 @@ export function sessionCard(
     blocks.push({
       type: "context",
       elements: [{ type: "mrkdwn", text: "⚪️ *Session ended.* This card is read-only." }],
+    });
+    return { text, blocks };
+  }
+
+  // herdr down (or the machine asleep when we last could talk to it): strip
+  // every control. Stale Reply/End buttons would only produce opaque Slack ⚠️.
+  if (view.herdrConnected === false) {
+    blocks.push({
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: "⚠️ *Computer unreachable.* Wake it and keep herdr running — Reply, Refresh, Earlier, and End session stay off until then.",
+        },
+      ],
     });
     return { text, blocks };
   }

@@ -93,7 +93,7 @@ export function groupByWorkspace(agents: HomeAgent[]): Map<string, HomeAgent[]> 
 function livenessFooter(model: HomeModel): Block {
   if (!model.slackConnected) return context("⚠️ reconnecting to Slack…");
   if (model.herdr !== "connected") {
-    return context("⚠️ herdr not connected — start it with `herdr`");
+    return context("⚠️ computer / herdr unreachable — wake it and run `herdr`");
   }
   const ago = model.syncedAgoMs;
   const text =
@@ -108,9 +108,9 @@ function livenessFooter(model: HomeModel): Block {
 function emptyState(model: HomeModel): Block[] | null {
   if (model.herdr !== "connected") {
     return [
-      section("*herdr is not running.*"),
+      section("*Your computer is not reachable.*"),
       context(
-        "Start it with `herdr`. This view will fill in on its own — nothing to restart here.",
+        "Wake the machine and start herdr (`herdr`). Phone control only works while the computer is awake — sleep freezes the daemon. This view fills in on its own once herdr reconnects.",
       ),
     ];
   }
@@ -128,6 +128,7 @@ export const MAX_HOME_BLOCKS = 100;
 const RESERVED_BLOCKS = 6;
 
 export function buildHome(model: HomeModel): Block[] {
+  const herdrUp = model.herdr === "connected";
   const blocks: Block[] = [
     {
       type: "header",
@@ -135,10 +136,13 @@ export function buildHome(model: HomeModel): Block[] {
     },
     {
       type: "actions",
-      elements: [
-        button("⟳ Refresh", "home_refresh", "refresh"),
-        button("＋ New agent", "home_new_agent", "new", "primary"),
-      ],
+      // New agent needs a live herdr; Refresh only re-publishes this view.
+      elements: herdrUp
+        ? [
+            button("⟳ Refresh", "home_refresh", "refresh"),
+            button("＋ New agent", "home_new_agent", "new", "primary"),
+          ]
+        : [button("⟳ Refresh", "home_refresh", "refresh")],
     },
   ];
 

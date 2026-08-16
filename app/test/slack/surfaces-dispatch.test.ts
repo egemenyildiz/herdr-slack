@@ -367,6 +367,39 @@ describe("Surfaces action dispatch", () => {
     expect(said(transport)).toContain("Use *Reply*");
   });
 
+  it("refuses session controls when herdr disconnects", async () => {
+    await transport.emitAction({
+      ctx: ctx(),
+      actionId: "home_open_session",
+      value: ref(),
+      triggerId: "t-open",
+    });
+
+    await fake.stop();
+    await new Promise<void>((resolve, reject) => {
+      if (tail.status !== "connected") {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(() => reject(new Error("tail stayed connected")), 3_000);
+      tail.on("status", ({ status }) => {
+        if (status !== "connected") {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+    });
+
+    await transport.emitAction({
+      ctx: ctx(),
+      actionId: SESSION_ACTIONS.refresh,
+      value: ref(),
+      triggerId: "t-refresh",
+    });
+    expect(said(transport)).toMatch(/not reachable/i);
+    expect(logs.join()).toContain("herdr_offline");
+  });
+
   it("dedupes bare Slack deliveries by message timestamp", async () => {
     const message = { ctx: ctx({ ts: "100.001" }), text: "Show my herd" };
     await transport.emitMessage(message);

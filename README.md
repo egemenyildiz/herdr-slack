@@ -21,6 +21,9 @@ No relay, no tunnel, no public URL, and no inbound listener on your machine.
 - Node.js ≥ 22
 - herdr ≥ 0.8.0 (protocol 19)
 - macOS or Linux
+- **The computer must stay awake** while you drive agents from Slack. Sleep freezes the daemon and
+  herdr; there is no wake-from-phone. When herdr is unreachable, Home and session cards drop every
+  interactive control (Reply, Refresh, Earlier, End session, New agent) and refuse those actions.
 
 ## Agent support
 

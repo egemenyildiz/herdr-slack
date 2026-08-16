@@ -53,18 +53,25 @@ describe("needsYou", () => {
 });
 
 describe("buildHome", () => {
-  it("always offers refresh and new-agent", () => {
+  it("always offers refresh and new-agent while herdr is up", () => {
     const blocks = buildHome(model());
     expect(text(blocks)).toContain("home_refresh");
     expect(text(blocks)).toContain("home_new_agent");
   });
 
-  it("says herdr is down instead of rendering a stale list", () => {
+  it("drops New agent when herdr is down, but keeps Refresh", () => {
+    const blocks = buildHome(model({ herdr: "waiting", agents: [agent()] }));
+    const rendered = text(blocks);
+    expect(rendered).toContain("home_refresh");
+    expect(rendered).not.toContain("home_new_agent");
+  });
+
+  it("says the computer is unreachable instead of rendering a stale list", () => {
     // Showing the last known agents while herdr is unreachable would be
     // confidently wrong, which is worse than showing nothing.
     const blocks = buildHome(model({ herdr: "waiting", agents: [agent()] }));
     const rendered = text(blocks);
-    expect(rendered).toContain("herdr is not running");
+    expect(rendered).toContain("not reachable");
     expect(rendered).not.toContain("a task");
   });
 
