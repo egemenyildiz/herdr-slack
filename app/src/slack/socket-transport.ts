@@ -9,7 +9,6 @@ import {
 } from "./transport.js";
 import type {
   ActionHandler,
-  CommandHandler,
   EphemeralInput,
   HomeHandler,
   InboundContext,
@@ -287,24 +286,6 @@ export class SocketModeTransport implements SlackTransport {
           ...(typeof context.retryNum === "number" ? { retryNum: context.retryNum } : {}),
         },
         text: str(record.text),
-      });
-    });
-  }
-
-  onCommand(handler: CommandHandler): void {
-    this.#app.command("/herd", async ({ ack, body }) => {
-      await ack();
-      this.#touch();
-      const payload = toRecord(body);
-      await handler({
-        ctx: {
-          teamId: str(payload.team_id),
-          userId: str(payload.user_id),
-          channel: str(payload.channel_id),
-          surface: "conversation",
-        },
-        text: str(payload.text),
-        triggerId: str(payload.trigger_id),
       });
     });
   }

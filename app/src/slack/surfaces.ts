@@ -6,7 +6,7 @@ import type { RateBudget } from "../daemon/budget.js";
 import type { HerdrClient } from "../herdr/client.js";
 import type { EventTail } from "../herdr/events.js";
 import type { SessionState } from "../herdr/state.js";
-import type { AgentStatus, PaneInfo } from "../herdr/types.js";
+import type { AgentStatus } from "../herdr/types.js";
 import { type SessionRegistry, sweepOrphans } from "../registry/registry.js";
 import { escapeMrkdwn } from "./format.js";
 import { ActionThrottle, type GuardDeps, authorizeAction, checkInbound } from "./guards.js";
@@ -40,28 +40,6 @@ export const CURSOR_IDLE_ACTIVITY_MS = 15_000;
 
 /** Debounce Home republish after state changes. */
 const HOME_DEBOUNCE_MS = 5_000;
-
-/** Exact-match keys for `/herd <query>` (herdr agent name, title, or kind). */
-export function herdQueryKeys(pane: PaneInfo): string[] {
-  const keys: string[] = [];
-  if (pane.label) keys.push(pane.label.toLowerCase());
-  if (pane.terminal_title_stripped) keys.push(pane.terminal_title_stripped.toLowerCase());
-  if (pane.agent) keys.push(pane.agent.toLowerCase());
-  return keys;
-}
-
-/** Resolve `/herd <query>` to one pane, or refuse ambiguous / unknown queries. */
-export function resolveAgentByQuery(
-  panes: PaneInfo[],
-  query: string,
-): PaneInfo | "none" | "ambiguous" {
-  const q = query.trim().toLowerCase();
-  if (!q) return "none";
-  const matches = panes.filter((pane) => herdQueryKeys(pane).includes(q));
-  if (matches.length === 0) return "none";
-  if (matches.length > 1) return "ambiguous";
-  return matches[0] as PaneInfo;
-}
 
 interface NoticeTarget {
   userId?: string | undefined;
@@ -216,16 +194,6 @@ export class Surfaces {
     transport.onConnectionChange((connected) => {
       log(`slack: ${connected ? "connected" : "disconnected"}`);
       if (connected) this.#scheduleHome();
-    });
-
-    transport.onCommand(async ({ ctx, text, triggerId }) => {
-      const decision = checkInbound(this.#guards, ctx);
-      if (!decision.allowed) {
-        log(`command denied: ${decision.reason}`);
-        return;
-      }
-      this.#lastActor = ctx.userId;
-      await this.#handleCommand(ctx.userId, ctx.channel, text.trim(), triggerId);
     });
 
     transport.onViewSubmit(async ({ ctx, callbackId, view, privateMetadata }) => {
@@ -415,41 +383,6 @@ export class Surfaces {
         defaults: readLastLaunch(this.deps.instance),
       }),
     );
-  }
-
-  async #handleCommand(
-    userId: string,
-    channel: string,
-    text: string,
-    triggerId: string,
-  ): Promise<void> {
-    if (text === "new") {
-      await this.#openNewAgentModal(triggerId);
-      return;
-    }
-
-    if (text === "blocked" || text === "") {
-      await this.publishHome(userId);
-      await this.#ephemeral(channel, "Your herd is on the *Home* tab.");
-      return;
-    }
-
-    const resolved = resolveAgentByQuery(this.deps.state.agentPanes(), text);
-    if (resolved === "none") {
-      await this.#ephemeral(
-        channel,
-        `No agent matching "${text}". Try \`/herd\` for the full list.`,
-      );
-      return;
-    }
-    if (resolved === "ambiguous") {
-      await this.#ephemeral(
-        channel,
-        "That matches more than one agent. Use an exact name or open one from the *Home* tab.",
-      );
-      return;
-    }
-    await this.#sessions.openSession(resolved.terminal_id, channel);
   }
 
   async #launchFromModal(userId: string, channel: string, view: unknown): Promise<void> {

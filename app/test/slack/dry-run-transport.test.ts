@@ -73,7 +73,6 @@ describe("DryRunTransport", () => {
     transport.onAction(fail);
     transport.onViewSubmit(fail);
     transport.onMessage(fail);
-    transport.onCommand(fail);
     transport.onHomeOpened(fail);
 
     let connected = false;

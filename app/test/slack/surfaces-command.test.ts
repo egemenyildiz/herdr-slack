@@ -10,7 +10,7 @@ import { SessionState } from "../../src/herdr/state.js";
 import { SessionRegistry } from "../../src/registry/registry.js";
 import { ACTION_IDS, BLOCK_IDS, MODAL_IDS } from "../../src/slack/modals.js";
 import { Surfaces } from "../../src/slack/surfaces.js";
-import { pane, workspace } from "../helpers/factories.js";
+import { workspace } from "../helpers/factories.js";
 import { FakeHerdr } from "../helpers/fake-herdr.js";
 import { FakeTransport } from "../helpers/fake-transport.js";
 
@@ -87,13 +87,21 @@ describe("Surfaces commands and launching", () => {
     delete process.env.HERDR_PLUGIN_CONFIG_DIR;
   });
 
-  describe("/herd new", () => {
+  describe("New agent button", () => {
+    const openModal = (overrides = {}) =>
+      transport.emitAction({
+        ctx: ctx(overrides),
+        actionId: "home_new_agent",
+        value: "new",
+        triggerId: "trig1",
+      });
+
     it("opens a skeleton before calling herdr, then fills it in", async () => {
       // trigger_id expires in ~3s; fetching first would routinely miss it.
       fake.on("workspace.list", () => ({ workspaces: [workspace()] }));
       fake.on("worktree.list", () => ({ worktrees: [] }));
 
-      await transport.emitCommand({ ctx: ctx(), text: "new", triggerId: "trig1" });
+      await openModal();
 
       expect(transport.modals).toHaveLength(1);
       expect(JSON.stringify(transport.modals[0]?.view)).toContain("Loading");
@@ -104,74 +112,14 @@ describe("Surfaces commands and launching", () => {
     it("still opens the modal when herdr cannot list workspaces", async () => {
       // No handlers registered → unknown_method. The form should degrade, not
       // leave the user with a spinner.
-      await transport.emitCommand({ ctx: ctx(), text: "new", triggerId: "trig1" });
+      await openModal();
       expect(transport.modalUpdates).toHaveLength(1);
     });
 
-    it("ignores a command from someone not on the allowlist", async () => {
-      await transport.emitCommand({
-        ctx: ctx({ userId: "U_OTHER" }),
-        text: "new",
-        triggerId: "t",
-      });
+    it("ignores the button from someone not on the allowlist", async () => {
+      await openModal({ userId: "U_OTHER" });
       expect(transport.modals).toEqual([]);
       expect(logs.join()).toContain("not_allowed");
-    });
-  });
-
-  describe("/herd", () => {
-    it("shows the herd for a bare command", async () => {
-      await transport.emitCommand({ ctx: ctx(), text: "", triggerId: "t" });
-      expect(transport.homes.length).toBeGreaterThan(0);
-    });
-
-    it("opens a session by exact title match", async () => {
-      state.apply({ type: "workspace_created", workspace: workspace() });
-      state.apply({
-        type: "pane_created",
-        pane: pane({ terminal_id: "term_1", terminal_title_stripped: "fix auth redirect" }),
-      });
-      surfaces.reconcileSessions();
-      fake.on("pane.read", () => ({ read: { text: "output" } }));
-
-      await transport.emitCommand({ ctx: ctx(), text: "fix auth redirect", triggerId: "t" });
-
-      expect(said(transport)).toContain("claude");
-    });
-
-    it("refuses a partial title match", async () => {
-      state.apply({ type: "workspace_created", workspace: workspace() });
-      state.apply({
-        type: "pane_created",
-        pane: pane({ terminal_id: "term_1", terminal_title_stripped: "fix auth redirect" }),
-      });
-      surfaces.reconcileSessions();
-
-      await transport.emitCommand({ ctx: ctx(), text: "auth", triggerId: "t" });
-
-      expect(said(transport)).toContain("No agent matching");
-    });
-
-    it("refuses an ambiguous agent query", async () => {
-      state.apply({ type: "workspace_created", workspace: workspace() });
-      state.apply({
-        type: "pane_created",
-        pane: pane({ terminal_id: "term_1", agent: "claude", terminal_title_stripped: "task a" }),
-      });
-      state.apply({
-        type: "pane_created",
-        pane: pane({ terminal_id: "term_2", agent: "claude", terminal_title_stripped: "task b" }),
-      });
-      surfaces.reconcileSessions();
-
-      await transport.emitCommand({ ctx: ctx(), text: "claude", triggerId: "t" });
-
-      expect(said(transport)).toContain("more than one agent");
-    });
-
-    it("says so when nothing matches, rather than opening the wrong agent", async () => {
-      await transport.emitCommand({ ctx: ctx(), text: "nonexistent", triggerId: "t" });
-      expect(said(transport)).toContain("No agent matching");
     });
   });
 

@@ -2,7 +2,7 @@
 #
 # Copy to your config dir (herdr-slack doctor prints the path) and edit.
 #
-# Only kinds listed here get mode choices in `/herd new`; every other kind
+# Only kinds listed here get mode choices in the New agent modal; every other kind
 # starts with its own defaults. Add a kind once you have verified its flags
 # actually work — a mode that fails at launch is worse than no mode.
 
