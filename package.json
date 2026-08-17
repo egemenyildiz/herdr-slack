@@ -1,6 +1,6 @@
 {
   "name": "herdr-slack",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Drive your local herdr agents from Slack — browse, prompt, approve, and launch agents from your phone.",
   "type": "module",
