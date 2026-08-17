@@ -1,5 +1,12 @@
 # herdr-slack
 
+> **Built by agents, lightly reviewed by a human.** This repository was written and reviewed almost
+> entirely by a combination of coding agents, with only minimal human review. Treat it as unaudited
+> until you have read the security-sensitive paths yourself — especially auth (`slack/guards.ts`),
+> credential handling, the herd registry / command queue, and anything that types into a terminal.
+> Do not run it against a machine or Slack workspace you care about until you are comfortable with
+> that code.
+
 <img src="assets/app-icon.png" alt="" width="88" align="right">
 
 Slack control plane for a local [herdr](https://herdr.dev) instance. Browse agents, answer blocked
