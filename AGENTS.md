@@ -59,6 +59,11 @@ Security-sensitive; breaking these is a security bug.
   lanes.
 - When herdr is down, cards and Home **omit** interactive controls and refuse those actions — keep
   the machine awake to drive agents from Slack.
+- **One Slack app may back many herdr sources** (same user, other OS user, remote). Exactly one
+  daemon is primary and owns Socket Mode + App Home; the rest are satellites that publish neither
+  and only write heartbeats into the shared `herdRegistryDir`. Two Socket Mode clients on one app
+  race for interactions, and two Home publishers overwrite each other — so ownership is a file
+  lock, not a convention. Cross-account setups must point every daemon at one writable directory.
 
 ## Layout
 
@@ -69,7 +74,7 @@ app/src/
   slack/     transport, turn cards/modals, response extraction, guards, redact
   agents/    agents.toml catalog, blocked-prompt menu parser
   config/    config, setup wizard, doctor
-  daemon/    supervisor, service units, rate budget
+  daemon/    supervisor, service units, rate budget, multi-herd registry
 app/test/    mirrors app/src
 ```
 

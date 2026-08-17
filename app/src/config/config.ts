@@ -31,6 +31,14 @@ export interface InstanceConfig {
   contentMode: ContentMode;
   excludePaths: string[];
   rateBudgetPerMin: number;
+  /**
+   * Shared directory where every daemon for this Slack app writes heartbeats.
+   *
+   * Absolute path. Same-user herds can omit this (defaults under the plugin
+   * config dir). Cross-account or remote herds must point every side at one
+   * writable place (e.g. `/Users/Shared/herdr-slack/registry`).
+   */
+  herdRegistryDir?: string;
 }
 
 export interface Config {
