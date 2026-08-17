@@ -46,6 +46,11 @@ Security-sensitive; breaking these is a security bug.
 9. **Never read the user's clipboard** (polling). Writing the setup manifest to the clipboard is
    allowed.
 10. **Allowlist is Slack member IDs only** — no handle/display-name resolution, no `users:read`.
+11. **Every herd-registry record is signed, and unverifiable records are dropped.** A shared registry
+    directory is writable by other local accounts, and a queued command is *typed into a terminal* —
+    so "can create a file there" must not mean "can drive your agents". The HMAC key derives from the
+    Slack bot token (`herd-signing.ts`), which only daemons on that app hold. Never add a registry
+    record type that skips `seal`/`unseal`.
 
 ## Interaction model
 
@@ -63,7 +68,18 @@ Security-sensitive; breaking these is a security bug.
   daemon is primary and owns Socket Mode + App Home; the rest are satellites that publish neither
   and only write heartbeats into the shared `herdRegistryDir`. Two Socket Mode clients on one app
   race for interactions, and two Home publishers overwrite each other — so ownership is a file
-  lock, not a convention. Cross-account setups must point every daemon at one writable directory.
+  lock, not a convention.
+- **Cross-account setups must set `herdRegistryDir` to one shared path on every daemon.** The default
+  is under each user's own config dir, so leaving it unset gives each daemon a *private* registry in
+  which it is trivially the only herd — both elect themselves primary and Home flaps between them.
+  Setting the key also switches the registry to shared file modes; the default stays 0700/0600.
+- **Ownership is only taken during election.** A satellite that claimed it mid-flight would demote
+  the real primary on its next tick and leave Slack with no owner at all, so a satellite that sees no
+  live owner exits non-zero and lets the service manager restart it into an election.
+- Home is a **two-level view** when more than one herd reports in: an overview of herds with their
+  agent counts, then one herd's agents. A single herd skips the overview.
+- `Surfaces` depends on **`HerdPort`**, not on `HerdBridge`, so the multi-herd paths are testable
+  without a registry directory or a second daemon.
 
 ## Layout
 

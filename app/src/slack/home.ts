@@ -10,6 +10,16 @@ export const GLYPH: Record<AgentStatus, string> = {
   unknown: "❔",
 };
 
+export const HOME_ACTIONS = {
+  refresh: "home_refresh",
+  newAgent: "home_new_agent",
+  openSession: "home_open_session",
+  selectHerd: "home_select_herd",
+} as const;
+
+/** Value used by the "all herds" overview, which is not a herd id. */
+export const ALL_HERDS = "__all__";
+
 export interface HomeAgent {
   ref: string;
   /** Button value — may be herd-encoded for foreign agents. */
@@ -22,7 +32,7 @@ export interface HomeAgent {
   workspaceId: string;
   workspaceLabel: string;
   permalink?: string;
-  /** Which herd this agent belongs to (for grouping / display). */
+  /** Which herd this agent belongs to. */
   herdId: string;
   herdLabel: string;
 }
@@ -46,6 +56,8 @@ export interface HomeModel {
   /** All live herds for this Slack app, including this daemon. */
   herds: HomeHerd[];
   localHerdId: string;
+  /** Which herd the reader drilled into, or ALL_HERDS / null for the overview. */
+  selectedHerdId: string | null;
   agents: HomeAgent[];
   herdr: TailStatus;
   slackConnected: boolean;
@@ -54,7 +66,6 @@ export interface HomeModel {
    * Refresh bumps this; it is not "time since Home was published".
    */
   herdrSyncedAgoMs: number | null;
-  /** When Home itself was last published (informational). */
   role: "primary" | "satellite";
 }
 
@@ -91,8 +102,8 @@ const button = (
 const openButton = (agent: HomeAgent): Block | undefined => {
   if (!agent.actionValue) return undefined;
   return agent.permalink
-    ? button("Open", "home_open_session", agent.actionValue, undefined, agent.permalink)
-    : button("Open", "home_open_session", agent.actionValue);
+    ? button("Open", HOME_ACTIONS.openSession, agent.actionValue, undefined, agent.permalink)
+    : button("Open", HOME_ACTIONS.openSession, agent.actionValue);
 };
 
 /** Slack rejects `accessory: undefined`, so the key has to be absent entirely. */
@@ -118,21 +129,21 @@ export function groupByWorkspace(agents: HomeAgent[]): Map<string, HomeAgent[]> 
   return groups;
 }
 
-function herdLine(herd: HomeHerd): string {
-  const status =
-    herd.herdrStatus === "connected"
-      ? "connected"
-      : herd.herdrStatus === "waiting"
-        ? "herdr down"
-        : "connecting";
-  const where = herd.isLocal ? "this daemon" : `${herd.user}@${herd.hostname}`;
-  const role = herd.role === "primary" ? "primary" : "satellite";
-  const socket = shortenPath(herd.socketPath);
-  // Same profile label on two herds is ambiguous — pid + host/user disambiguates.
-  return (
-    `*${escapeMrkdwn(herd.label || herd.instance)}* · pid \`${herd.pid}\` · ${role}\n` +
-    `\`${escapeMrkdwn(socket)}\` · ${status} · ${herd.agentCount} agent${herd.agentCount === 1 ? "" : "s"} · ${escapeMrkdwn(where)}`
-  );
+/**
+ * Which herd the view is showing.
+ *
+ * A single herd never shows the overview — there is nothing to choose between,
+ * and an extra tap to see your only machine is noise.
+ */
+export function resolveSelection(model: HomeModel): HomeHerd | null {
+  if (model.herds.length === 1) return model.herds[0] ?? null;
+  if (!model.selectedHerdId || model.selectedHerdId === ALL_HERDS) return null;
+  return model.herds.find((herd) => herd.herdId === model.selectedHerdId) ?? null;
+}
+
+function statusWord(herd: HomeHerd): string {
+  if (herd.herdrStatus === "connected") return "connected";
+  return herd.herdrStatus === "waiting" ? "herdr down" : "connecting";
 }
 
 function shortenPath(socketPath: string): string {
@@ -141,13 +152,25 @@ function shortenPath(socketPath: string): string {
   return socketPath;
 }
 
+/**
+ * The one-line identity of a herd.
+ *
+ * The pid is here because two machines can both be labelled "work"; without it
+ * there is nothing on screen that tells them apart.
+ */
+function herdDetail(herd: HomeHerd): string {
+  const where = herd.isLocal ? "this daemon" : `${herd.user}@${herd.hostname}`;
+  const count = `${herd.agentCount} agent${herd.agentCount === 1 ? "" : "s"}`;
+  return (
+    `pid \`${herd.pid}\` · ${herd.role} · \`${escapeMrkdwn(shortenPath(herd.socketPath))}\` · ` +
+    `${statusWord(herd)} · ${count} · ${escapeMrkdwn(where)}`
+  );
+}
+
 function livenessFooter(model: HomeModel): Block {
   if (!model.slackConnected) return context("⚠️ reconnecting to Slack…");
   if (model.role === "satellite") {
     return context("satellite — Home is published by the primary daemon for this Slack app");
-  }
-  if (model.herdr !== "connected") {
-    return context("⚠️ this herd's herdr is unreachable — wake the machine and run `herdr`");
   }
   const ago = model.herdrSyncedAgoMs;
   const text =
@@ -159,126 +182,152 @@ function livenessFooter(model: HomeModel): Block {
   return context(text);
 }
 
-function emptyState(model: HomeModel): Block[] | null {
-  const foreignAgents = model.agents.filter(
-    (agent) => agent.herdId && agent.herdId !== model.localHerdId,
-  );
-  // Local herdr down and nothing from peers → do not render a stale local list.
-  if (model.herdr !== "connected" && foreignAgents.length === 0) {
-    return [
-      section("*Your computer is not reachable.*"),
-      context(
-        "Wake the machine and start herdr (`herdr`). Phone control only works while the computer is awake — sleep freezes the daemon. This view fills in on its own once herdr reconnects.",
-      ),
-    ];
-  }
-  if (model.agents.length === 0) {
-    return [
-      section("*No agents running.*"),
-      context("Tap *＋ New agent* above, or start one in herdr and it will appear here."),
-    ];
-  }
-  return null;
-}
-
 /** Slack rejects Home views with more than 100 blocks. */
 export const MAX_HOME_BLOCKS = 100;
 const RESERVED_BLOCKS = 8;
 
-function herdsHeader(model: HomeModel): Block[] {
-  if (model.herds.length === 0) return [];
-  const blocks: Block[] = [divider(), section("*Herds*")];
-  for (const herd of model.herds) blocks.push(section(herdLine(herd)));
-  return blocks;
+function agentRow(agent: HomeAgent, detailed: boolean): Block {
+  const text = detailed
+    ? `${GLYPH[agent.status]} *${escapeMrkdwn(agent.agent)}* · ${escapeMrkdwn(agent.title)}\n\`${escapeMrkdwn(agent.cwd)}\``
+    : `${GLYPH[agent.status]} \`${escapeMrkdwn(agent.agent)}\`  ${escapeMrkdwn(agent.title)}`;
+  return withOpen({ type: "section", text: { type: "mrkdwn", text } }, agent);
 }
 
-function attentionBlocks(model: HomeModel): Block[] {
-  const attention = needsYou(model.agents);
-  if (attention.length === 0) return [];
-  const blocks: Block[] = [divider(), section(`*🔴 NEEDS YOU (${attention.length})*`)];
-  for (const agent of attention) {
-    blocks.push(
-      withOpen(
-        {
-          type: "section",
-          text: {
-            type: "mrkdwn",
-            text: `${GLYPH[agent.status]} *${escapeMrkdwn(agent.agent)}* · ${escapeMrkdwn(agent.title)}\n\`${escapeMrkdwn(agent.cwd)}\`${herdSuffix(agent, model)}`,
-          },
-        },
-        agent,
-      ),
-    );
+/** The overview: every herd, selectable, with what is waiting on each. */
+function overviewBlocks(model: HomeModel): Block[] {
+  const blocks: Block[] = [];
+  for (const herd of model.herds) {
+    const waiting = needsYou(model.agents.filter((a) => a.herdId === herd.herdId)).length;
+    const attention = waiting > 0 ? `\n🔴 ${waiting} waiting on you` : "";
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*${escapeMrkdwn(herd.label || herd.instance)}*\n${herdDetail(herd)}${attention}`,
+      },
+      accessory: button("Open", HOME_ACTIONS.selectHerd, herd.herdId),
+    });
   }
   return blocks;
 }
 
+function attentionBlocks(agents: HomeAgent[], model: HomeModel): Block[] {
+  const attention = needsYou(agents);
+  if (attention.length === 0) return [];
+  const blocks: Block[] = [divider(), section(`*🔴 NEEDS YOU (${attention.length})*`)];
+  for (const agent of attention) {
+    const row = agentRow(agent, true);
+    blocks.push(model.herds.length > 1 && !model.selectedHerdId ? tagHerd(row, agent) : row);
+  }
+  return blocks;
+}
+
+/** Name the herd on a row that is shown outside its own herd's view. */
+function tagHerd(row: Block, agent: HomeAgent): Block {
+  const text = (row.text as { text?: string } | undefined)?.text ?? "";
+  return { ...row, text: { type: "mrkdwn", text: `${text}\n_${escapeMrkdwn(agent.herdLabel)}_` } };
+}
+
 function workspaceBlocks(
-  model: HomeModel,
+  agents: HomeAgent[],
   startLength: number,
 ): { blocks: Block[]; hidden: number } {
   const blocks: Block[] = [];
   let hidden = 0;
-  for (const [workspace, agents] of groupByWorkspace(model.agents)) {
+  for (const [workspace, group] of groupByWorkspace(agents)) {
     if (startLength + blocks.length + RESERVED_BLOCKS >= MAX_HOME_BLOCKS) {
-      hidden += agents.length;
+      hidden += group.length;
       continue;
     }
     blocks.push(
       divider(),
-      section(`*${workspace}*  ·  ${agents.length} agent${agents.length === 1 ? "" : "s"}`),
+      section(`*${workspace}*  ·  ${group.length} agent${group.length === 1 ? "" : "s"}`),
     );
-    for (const agent of agents) {
+    for (const agent of group) {
       if (startLength + blocks.length + RESERVED_BLOCKS >= MAX_HOME_BLOCKS) {
         hidden += 1;
         continue;
       }
-      blocks.push(
-        withOpen(
-          {
-            type: "section",
-            text: {
-              type: "mrkdwn",
-              text: `${GLYPH[agent.status]} \`${escapeMrkdwn(agent.agent)}\`  ${escapeMrkdwn(agent.title)}${herdSuffix(agent, model)}`,
-            },
-          },
-          agent,
-        ),
-      );
+      blocks.push(agentRow(agent, false));
     }
   }
   return { blocks, hidden };
 }
 
 export function buildHome(model: HomeModel): Block[] {
-  const localUp = model.herdr === "connected";
-  const title =
-    model.herds.length <= 1
-      ? `🐑 Herd · ${model.herds[0]?.label || "herdr"}`
-      : `🐑 Herds · ${model.herds.length}`;
+  const selected = resolveSelection(model);
+  const multi = model.herds.length > 1;
+  const agents = selected
+    ? model.agents.filter((agent) => agent.herdId === selected.herdId)
+    : model.agents;
+
+  // New agent needs a reachable herdr somewhere: this one when a herd is
+  // selected, any of them from the overview.
+  const canLaunch = selected
+    ? selected.herdrStatus === "connected"
+    : model.herds.some((herd) => herd.herdrStatus === "connected");
+
+  const title = selected
+    ? `🐑 Herd · ${selected.label || selected.instance}`
+    : `🐑 Herds · ${model.herds.length}`;
+
+  const controls: Block[] = [button("⟳ Refresh", HOME_ACTIONS.refresh, "refresh")];
+  if (canLaunch) {
+    controls.push(button("＋ New agent", HOME_ACTIONS.newAgent, "new", "primary"));
+  }
+  if (selected && multi) {
+    controls.push(button("↩ All herds", HOME_ACTIONS.selectHerd, ALL_HERDS));
+  }
 
   const blocks: Block[] = [
-    {
-      type: "header",
-      text: { type: "plain_text", text: title, emoji: true },
-    },
-    {
-      type: "actions",
-      elements: localUp
-        ? [
-            button("⟳ Refresh", "home_refresh", "refresh"),
-            button("＋ New agent", "home_new_agent", "new", "primary"),
-          ]
-        : [button("⟳ Refresh", "home_refresh", "refresh")],
-    },
-    ...herdsHeader(model),
+    { type: "header", text: { type: "plain_text", text: title, emoji: true } },
+    // The herd's identity belongs directly under its name, not in a second
+    // section repeating it.
+    ...(selected ? [context(herdDetail(selected))] : []),
+    { type: "actions", elements: controls },
   ];
 
-  const empty = emptyState(model);
-  if (empty) return [...blocks, ...empty, divider(), livenessFooter(model)];
+  if (!selected) {
+    if (model.herds.length === 0) {
+      return [
+        ...blocks,
+        section("*No herds are reporting in.*"),
+        context(
+          "Each machine runs its own daemon. Start herdr and the daemon on at least one, and it will appear here.",
+        ),
+        divider(),
+        livenessFooter(model),
+      ];
+    }
+    blocks.push(divider(), ...overviewBlocks(model), ...attentionBlocks(agents, model));
+    blocks.push(divider(), livenessFooter(model));
+    return blocks;
+  }
 
-  blocks.push(...attentionBlocks(model));
-  const { blocks: workspaces, hidden } = workspaceBlocks(model, blocks.length);
+  if (selected.herdrStatus !== "connected") {
+    return [
+      ...blocks,
+      section("*This machine is not reachable.*"),
+      context(
+        "Wake it and start herdr (`herdr`). Phone control only works while the computer is awake — sleep freezes its daemon. This fills in on its own once herdr reconnects.",
+      ),
+      divider(),
+      livenessFooter(model),
+    ];
+  }
+
+  if (agents.length === 0) {
+    return [
+      ...blocks,
+      section("*No agents running.*"),
+      context("Tap *＋ New agent* above, or start one in herdr and it will appear here."),
+      divider(),
+      livenessFooter(model),
+    ];
+  }
+
+  blocks.push(...attentionBlocks(agents, model));
+  const { blocks: workspaces, hidden } = workspaceBlocks(agents, blocks.length);
   blocks.push(...workspaces);
 
   if (hidden > 0) {
@@ -291,11 +340,6 @@ export function buildHome(model: HomeModel): Block[] {
 
   blocks.push(divider(), livenessFooter(model));
   return blocks;
-}
-
-function herdSuffix(agent: HomeAgent, model: HomeModel): string {
-  if (model.herds.length <= 1 || agent.herdId === model.localHerdId) return "";
-  return `\n_${escapeMrkdwn(agent.herdLabel)}_`;
 }
 
 export function agentFromPane(

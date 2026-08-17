@@ -3,7 +3,6 @@ import { readLastLaunch, writeLastLaunch } from "../agents/last-launch.js";
 import { launchAgent, sanitizeAgentName } from "../agents/launcher.js";
 import type { InstanceConfig } from "../config/config.js";
 import type { RateBudget } from "../daemon/budget.js";
-import type { HerdBridge } from "../daemon/herd-bridge.js";
 import { decodeHerdRef } from "../daemon/herd-registry.js";
 import type { HerdrClient } from "../herdr/client.js";
 import type { EventTail } from "../herdr/events.js";
@@ -18,11 +17,24 @@ import {
   checkInbound,
   requireHerdr,
 } from "./guards.js";
-import { GLYPH, type HomeAgent, type HomeHerd, agentFromPane, buildHome } from "./home.js";
+import type { HerdPort } from "./herd-port.js";
+import {
+  ALL_HERDS,
+  GLYPH,
+  HOME_ACTIONS,
+  type HomeAgent,
+  type HomeHerd,
+  agentFromPane,
+  buildHome,
+} from "./home.js";
 import { resolveThreadPermalink } from "./links.js";
 import {
+  ACTION_IDS,
   BLOCK_IDS,
   MODAL_IDS,
+  MODAL_INPUT_ACTION_IDS,
+  type NewAgentSubmission,
+  type NewAgentTargets,
   buildHistoryModal,
   buildNewAgentModal,
   buildReplyModal,
@@ -70,7 +82,7 @@ export interface SurfacesDeps {
   /** Wait after cursor goes idle before posting activity. Defaults to CURSOR_IDLE_ACTIVITY_MS. */
   cursorIdleActivityMs?: number;
   /** Multi-herd coordination; omitted in unit tests that only exercise local Home. */
-  herd?: HerdBridge;
+  herd?: HerdPort;
   log: (line: string) => void;
 }
 
@@ -91,6 +103,8 @@ export class Surfaces {
   #cursorIdleTimers = new Map<string, NodeJS.Timeout>();
   /** Slack message deliveries already handled (`channel:ts` or event id). */
   #seenMessageKeys = new Set<string>();
+  /** userId → herd they drilled into on Home. Lost on restart, which is fine. */
+  #homeSelection = new Map<string, string>();
 
   constructor(private readonly deps: SurfacesDeps) {
     const isHerdrConnected = (): boolean => deps.tail.status === "connected";
@@ -125,9 +139,9 @@ export class Surfaces {
       await this.publishHome(ctx.userId);
     });
 
-    transport.onAction(async ({ ctx, actionId, value, triggerId, viewId }) => {
+    transport.onAction(async ({ ctx, actionId, value, triggerId, viewId, selectedOption }) => {
       this.#lastActor = ctx.userId;
-      await this.#onAction(ctx, actionId, value, triggerId, viewId);
+      await this.#onAction(ctx, actionId, value, triggerId, viewId, selectedOption);
     });
 
     // Bare DMs have no thread target; treat them as commands, not prompts.
@@ -351,6 +365,17 @@ export class Surfaces {
       log(`view submit denied: ${decision.reason}`);
       return;
     }
+    // A launch may target a peer herd, so this daemon's own herdr being down is
+    // not grounds to refuse it; the target's reachability is checked on arrival.
+    if (callbackId === MODAL_IDS.newAgent) {
+      await this.#launchFromModal(
+        ctx.userId,
+        await this.#replyChannel(ctx),
+        view,
+        privateMetadata ?? "",
+      );
+      return;
+    }
     const herdr = requireHerdr(this.#guards);
     if (!herdr.allowed) {
       log(`view submit denied: ${herdr.reason}`);
@@ -361,10 +386,6 @@ export class Surfaces {
         await this.#replyChannel(ctx),
         herdr.message ?? "herdr is not connected.",
       );
-      return;
-    }
-    if (callbackId === MODAL_IDS.newAgent) {
-      await this.#launchFromModal(ctx.userId, await this.#replyChannel(ctx), view);
       return;
     }
     if (callbackId !== MODAL_IDS.reply) return;
@@ -380,27 +401,121 @@ export class Surfaces {
   }
 
   /** Open the launch modal; skeleton first because trigger_id expires quickly. */
-  async #openNewAgentModal(triggerId: string): Promise<void> {
+  async #openNewAgentModal(triggerId: string, userId: string): Promise<void> {
     const viewId = await this.deps.transport.openModal(triggerId, skeletonModal("New agent"));
-    const [workspaces, worktrees] = await Promise.all([
-      this.deps.client.workspaceList().catch(() => []),
-      this.deps.client.worktreeList().catch(() => []),
-    ]);
+    const selection = this.#homeSelection.get(userId);
+    const preferred =
+      selection && selection !== ALL_HERDS ? selection : (this.deps.herd?.herdId ?? "");
+    await this.#renderNewAgentModal(viewId, preferred);
+  }
+
+  /**
+   * Render the launch form for one herd.
+   *
+   * Re-rendered when the herd changes because everything below that choice
+   * (workspaces, worktrees, agent kinds) belongs to the herd, not to us.
+   */
+  async #renderNewAgentModal(viewId: string, herdId: string): Promise<void> {
+    const { herd } = this.deps;
+    const herds = (herd?.homeHerds() ?? []).map((row) => ({
+      herdId: row.herdId,
+      label: row.label,
+      agentCount: row.agentCount,
+      reachable: row.herdrStatus === "connected",
+    }));
+    const target = herds.some((row) => row.herdId === herdId)
+      ? herdId
+      : (herds.find((row) => row.reachable)?.herdId ?? herdId);
+    const targets = await this.#launchTargets(target);
     await this.deps.transport.updateModal(
       viewId,
       buildNewAgentModal({
-        workspaces,
-        worktrees,
-        catalog: loadCatalog(),
-        defaults: readLastLaunch(this.deps.instance),
+        ...targets,
+        herds,
+        selectedHerdId: target,
+        // Defaults describe the last launch on *this* herd, so they only make
+        // sense when that is what is selected.
+        ...(target === (herd?.herdId ?? "")
+          ? { defaults: readLastLaunch(this.deps.instance) }
+          : {}),
       }),
     );
   }
 
-  async #launchFromModal(userId: string, channel: string, view: unknown): Promise<void> {
-    const submission = parseNewAgentSubmission(view);
+  /** Launch options for a herd: live from herdr locally, heartbeat for a peer. */
+  async #launchTargets(herdId: string): Promise<NewAgentTargets> {
+    const { herd } = this.deps;
+    const isLocal = !herd || herdId === herd.herdId;
+    if (isLocal) {
+      const [workspaces, worktrees] = await Promise.all([
+        this.deps.client.workspaceList().catch(() => []),
+        this.deps.client.worktreeList().catch(() => []),
+      ]);
+      return {
+        workspaces: workspaces.map((w) => ({
+          id: w.workspace_id,
+          label: w.label || w.workspace_id,
+        })),
+        worktrees: worktrees.map((tree) => ({
+          label: tree.label,
+          path: tree.path,
+          ...(tree.branch ? { branch: tree.branch } : {}),
+        })),
+        kinds: loadCatalog().map((entry) => ({ kind: entry.kind, label: entry.label })),
+      };
+    }
+    const remote = herd.launchOptionsFor(herdId);
+    return remote ?? { workspaces: [], worktrees: [], kinds: [] };
+  }
+
+  /**
+   * Hand a launch to the herd that owns the machine.
+   *
+   * We cannot start it ourselves — the target herdr is on a socket only that
+   * daemon can reach — so this is fire-and-forget and Home is the receipt.
+   */
+  async #forwardLaunch(
+    herd: HerdPort,
+    submission: NewAgentSubmission,
+    channel: string,
+    userId: string,
+  ): Promise<void> {
+    herd.forwardCommand({
+      op: "launch_agent",
+      herdId: submission.herdId ?? "",
+      ref: "",
+      channel,
+      userId,
+      launch: {
+        kind: submission.kind,
+        ...(submission.workspaceId ? { workspaceId: submission.workspaceId } : {}),
+        ...(submission.cwd ? { cwd: submission.cwd } : {}),
+        ...(submission.label ? { label: submission.label } : {}),
+        ...(submission.firstPrompt ? { firstPrompt: submission.firstPrompt } : {}),
+      },
+    });
+    this.deps.log(`forwarded launch ${submission.kind} to herd ${submission.herdId}`);
+    await this.#ephemeral(
+      channel,
+      `Starting *${submission.kind}* on that herd — it will appear on Home shortly.`,
+    );
+  }
+
+  async #launchFromModal(
+    userId: string,
+    channel: string,
+    view: unknown,
+    privateMetadata = "",
+  ): Promise<void> {
+    const submission = parseNewAgentSubmission(view, privateMetadata);
     if (!submission) {
       await this.#ephemeral(channel, "That form was missing an agent.");
+      return;
+    }
+
+    const { herd } = this.deps;
+    if (herd && submission.herdId && submission.herdId !== herd.herdId) {
+      await this.#forwardLaunch(herd, submission, channel, userId);
       return;
     }
 
@@ -496,10 +611,20 @@ export class Surfaces {
     registry.save();
   }
 
+  /**
+   * This daemon's herd id.
+   *
+   * Falls back to the instance key so the id is never empty: Home filters agent
+   * rows by herd, and an empty id would match no herd and hide every agent.
+   */
+  #localHerdId(): string {
+    return this.deps.herd?.herdId ?? this.deps.instance;
+  }
+
   /** Build the Home model from live state, never from the registry alone. */
   homeAgents(): HomeAgent[] {
     const { state, registry, herd, config } = this.deps;
-    const localHerdId = herd?.herdId ?? "";
+    const localHerdId = this.#localHerdId();
     const localLabel = config.label || this.deps.instance;
     // Mint refs for new agents so Home buttons always carry a valid target.
     for (const pane of state.agentPanes()) {
@@ -557,7 +682,8 @@ export class Surfaces {
         userId,
         buildHome({
           herds: herd?.homeHerds() ?? [this.#soloHerd(agents.length)],
-          localHerdId: herd?.herdId ?? this.deps.instance,
+          localHerdId: this.#localHerdId(),
+          selectedHerdId: this.#homeSelection.get(userId) ?? null,
           agents,
           herdr: tail.status,
           slackConnected: transport.connected,
@@ -573,7 +699,7 @@ export class Surfaces {
   /** Home's herd row when no bridge is wired (unit tests, single-herd fallback). */
   #soloHerd(agentCount: number): HomeHerd {
     return {
-      herdId: this.deps.instance,
+      herdId: this.#localHerdId(),
       label: this.deps.config.label || this.deps.instance,
       pid: process.pid,
       instance: this.deps.instance,
@@ -601,10 +727,23 @@ export class Surfaces {
     value: string,
     triggerId: string,
     viewId?: string,
+    selectedOption?: string,
   ): Promise<void> {
     const { log } = this.deps;
-    if (actionId === "home_refresh" || actionId === "home_new_agent") {
-      await this.#onHomeChrome(ctx, actionId, triggerId);
+    // Form inputs fire block_actions too. They carry no ref, so falling through
+    // to ref resolution would answer every pick with "I do not recognise that".
+    if (MODAL_INPUT_ACTION_IDS.includes(actionId)) {
+      if (actionId === ACTION_IDS.herd && viewId && selectedOption) {
+        await this.#renderNewAgentModal(viewId, selectedOption);
+      }
+      return;
+    }
+    if (
+      actionId === HOME_ACTIONS.refresh ||
+      actionId === HOME_ACTIONS.newAgent ||
+      actionId === HOME_ACTIONS.selectHerd
+    ) {
+      await this.#onHomeChrome(ctx, actionId, triggerId, value);
       return;
     }
     const rawForAuth = SessionController.isMenuChoiceAction(actionId)
@@ -632,34 +771,56 @@ export class Surfaces {
     await this.#dispatch(actionId, result.terminalId ?? "", value, channel, triggerId, viewId);
   }
 
-  async #onHomeChrome(ctx: InboundContext, actionId: string, triggerId: string): Promise<void> {
+  async #onHomeChrome(
+    ctx: InboundContext,
+    actionId: string,
+    triggerId: string,
+    value: string,
+  ): Promise<void> {
     const { log } = this.deps;
     const decision = checkInbound(this.#guards, ctx);
     if (!decision.allowed) {
       log(`action ${actionId} denied: ${decision.reason}`);
       return;
     }
-    if (actionId === "home_refresh") {
+    if (actionId === HOME_ACTIONS.selectHerd) {
+      this.#homeSelection.set(ctx.userId, value);
+      await this.publishHome(ctx.userId);
+      return;
+    }
+    if (actionId === HOME_ACTIONS.refresh) {
       await this.#resyncHerdr(ctx.userId);
       return;
     }
-    const herdr = requireHerdr(this.#guards);
-    if (!herdr.allowed) {
-      log(`action ${actionId} denied: ${herdr.reason}`);
+    // A launch needs a reachable herdr, but not necessarily this one — the form
+    // can target a peer.
+    if (!this.#anyHerdReachable(ctx.userId)) {
+      log(`action ${actionId} denied: no reachable herdr`);
       await this.#ephemeral(
         await this.#replyChannel(ctx),
-        herdr.message ?? "herdr is not connected.",
+        "No herd is reachable right now — wake a machine and start herdr.",
       );
       return;
     }
-    await this.#openNewAgentModal(triggerId);
+    await this.#openNewAgentModal(triggerId, ctx.userId);
+  }
+
+  #anyHerdReachable(userId: string): boolean {
+    const herds = this.deps.herd?.homeHerds();
+    if (!herds || herds.length === 0) return this.deps.tail.status === "connected";
+    const selected = this.#homeSelection.get(userId);
+    // Drilled into one herd: that is the one the button belongs to.
+    if (selected && selected !== ALL_HERDS) {
+      const target = herds.find((herd) => herd.herdId === selected);
+      if (target) return target.herdrStatus === "connected";
+    }
+    return herds.some((herd) => herd.herdrStatus === "connected");
   }
 
   #routeHerdRef(value: string): { herdId: string; ref: string; foreign: boolean } {
-    const localHerdId = this.deps.herd?.herdId ?? "";
-    const decoded = decodeHerdRef(value, localHerdId || "local");
-    const foreign = Boolean(localHerdId && decoded.herdId !== localHerdId);
-    return { ...decoded, foreign };
+    const localHerdId = this.#localHerdId();
+    const decoded = decodeHerdRef(value, localHerdId);
+    return { ...decoded, foreign: decoded.herdId !== localHerdId };
   }
 
   async #forwardForeign(

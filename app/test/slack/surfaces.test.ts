@@ -8,8 +8,10 @@ import { HerdrClient } from "../../src/herdr/client.js";
 import { EventTail } from "../../src/herdr/events.js";
 import { SessionState } from "../../src/herdr/state.js";
 import { SessionRegistry } from "../../src/registry/registry.js";
+import type { HerdPort } from "../../src/slack/herd-port.js";
 import { Surfaces } from "../../src/slack/surfaces.js";
 import { pane, workspace } from "../helpers/factories.js";
+import { FakeHerd } from "../helpers/fake-herd.js";
 import { FakeHerdr } from "../helpers/fake-herdr.js";
 import { FakeTransport } from "../helpers/fake-transport.js";
 
@@ -35,7 +37,7 @@ describe("Surfaces", () => {
 
   const settle = (ms = 40) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  const build = async (cfg = config()) => {
+  const build = async (cfg = config(), herd?: HerdPort) => {
     logs = [];
     transport = new FakeTransport();
     state = new SessionState();
@@ -58,6 +60,7 @@ describe("Surfaces", () => {
       client: new HerdrClient(fakeHerdr.socketPath, 500),
       budget: new RateBudget({ totalPerMin: 100 }),
       log: (line) => logs.push(line),
+      ...(herd ? { herd } : {}),
     });
     surfaces.start();
     return surfaces;
@@ -152,6 +155,160 @@ describe("Surfaces", () => {
       for (let i = 0; i < 8; i += 1) await transport.emitHomeOpened(ctx());
       expect(transport.homes.length).toBeLessThanOrEqual(6);
       expect(logs.join()).toContain("rate budget exhausted");
+    });
+  });
+
+  describe("many herds on one Slack app", () => {
+    const modalJson = () => JSON.stringify(transport.modalUpdates.at(-1)?.view ?? {});
+
+    it("drills into a herd and shows only its agents", async () => {
+      const herd = FakeHerd.withPeer();
+      await build(config(), herd);
+      state.apply({ type: "workspace_created", workspace: workspace({ label: "posi" }) });
+      state.apply({ type: "pane_created", pane: pane({ terminal_title_stripped: "my task" }) });
+      surfaces.reconcileSessions();
+
+      await transport.emitHomeOpened(ctx());
+      // The overview lists both, and neither one's agents.
+      expect(transport.lastHomeText()).toContain("🐑 Herds · 2");
+
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_select_herd",
+        value: "host:them:default",
+        triggerId: "t1",
+      });
+      const rendered = transport.lastHomeText();
+      expect(rendered).toContain("peer task");
+      expect(rendered).not.toContain("my task");
+    });
+
+    it("remembers the drill-down per person, and lets them back out", async () => {
+      await build(config(), FakeHerd.withPeer());
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_select_herd",
+        value: "host:them:default",
+        triggerId: "t1",
+      });
+      // Someone else opening Home is still on the overview.
+      await transport.emitHomeOpened(ctx({ userId: "U1" }));
+      expect(transport.lastHomeText()).toContain("🐑 Herd · personal");
+
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_select_herd",
+        value: "__all__",
+        triggerId: "t2",
+      });
+      expect(transport.lastHomeText()).toContain("🐑 Herds · 2");
+    });
+
+    it("offers the herd picker first in the launch form", async () => {
+      await build(config(), FakeHerd.withPeer());
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_new_agent",
+        value: "new",
+        triggerId: "t1",
+      });
+      const blocks = (transport.modalUpdates.at(-1)?.view.blocks ?? []) as { block_id: string }[];
+      expect(blocks[0]?.block_id).toBe("b_herd");
+      expect(modalJson()).toContain("personal");
+    });
+
+    it("re-renders the form with the chosen herd's workspaces", async () => {
+      await build(config(), FakeHerd.withPeer());
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_new_agent",
+        value: "new",
+        triggerId: "t1",
+      });
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "a_herd",
+        value: "",
+        triggerId: "t2",
+        viewId: "V1",
+        selectedOption: "host:them:default",
+      });
+      // Those belong to the peer, and could not have come from our own socket.
+      expect(modalJson()).toContain("their workspace");
+      expect(modalJson()).toContain("their-tree");
+    });
+
+    it("does not answer a form input as if it were a session button", async () => {
+      // Selects fire block_actions with no value; treating that as a ref
+      // answered every pick with "I do not recognise that".
+      await build(config(), FakeHerd.withPeer());
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "a_workspace",
+        value: "",
+        triggerId: "t1",
+        viewId: "V1",
+      });
+      expect(transport.ephemerals).toEqual([]);
+      expect(logs.join()).not.toContain("unknown_ref");
+    });
+
+    it("hands a launch on another herd to the daemon that owns it", async () => {
+      const herd = FakeHerd.withPeer();
+      await build(config(), herd);
+      await transport.emitViewSubmit({
+        ctx: ctx(),
+        callbackId: "modal_new_agent",
+        view: {
+          values: {
+            b_herd: { a_herd: { selected_option: { value: "host:them:default" } } },
+            b_kind: { a_kind: { selected_option: { value: "claude" } } },
+            b_prompt: { a_prompt: { value: "start on the bug" } },
+          },
+        },
+      });
+      expect(herd.forwarded).toHaveLength(1);
+      const [forwarded] = herd.forwarded;
+      expect(forwarded?.op).toBe("launch_agent");
+      expect(forwarded?.herdId).toBe("host:them:default");
+      expect(forwarded?.launch).toMatchObject({ kind: "claude", firstPrompt: "start on the bug" });
+    });
+
+    it("launches locally when the form names this herd", async () => {
+      const herd = FakeHerd.withPeer();
+      await build(config(), herd);
+      await transport.emitViewSubmit({
+        ctx: ctx(),
+        callbackId: "modal_new_agent",
+        view: {
+          values: {
+            b_herd: { a_herd: { selected_option: { value: "host:me:default" } } },
+            b_kind: { a_kind: { selected_option: { value: "claude" } } },
+          },
+        },
+      });
+      expect(herd.forwarded).toEqual([]);
+    });
+
+    it("refuses to open the form when no herd is reachable", async () => {
+      const herd = FakeHerd.withPeer();
+      herd.setUnreachable("host:me:default");
+      herd.setUnreachable("host:them:default");
+      await build(config(), herd);
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_new_agent",
+        value: "new",
+        triggerId: "t1",
+      });
+      expect(transport.modals).toEqual([]);
+      expect(transport.ephemerals.at(-1)?.text).toContain("No herd is reachable");
+    });
+
+    it("wires the session controller into the bridge so forwarded work can run", async () => {
+      const herd = FakeHerd.withPeer();
+      await build(config(), herd);
+      expect(herd.attached).not.toBeNull();
     });
   });
 

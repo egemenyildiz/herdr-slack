@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ALL_HERDS,
   type HomeAgent,
   type HomeHerd,
   type HomeModel,
@@ -42,9 +43,15 @@ const agent = (overrides: Partial<HomeAgent> = {}): HomeAgent => ({
   ...overrides,
 });
 
+/**
+ * A herd's own `herdrStatus` is what decides its view, and in the daemon it is
+ * derived from the same tail status as `herdr` — so the fixture keeps them in
+ * step unless a test sets `herds` explicitly.
+ */
 const model = (overrides: Partial<HomeModel> = {}): HomeModel => ({
-  herds: [herd()],
+  herds: [herd({ herdrStatus: overrides.herdr ?? "connected" })],
   localHerdId: "host:user:default",
+  selectedHerdId: null,
   agents: [agent()],
   herdr: "connected",
   slackConnected: true,
@@ -189,11 +196,127 @@ describe("buildHome", () => {
     expect(rendered).toContain("beta");
   });
 
+  it("folds the herd's identity under its name instead of repeating it", () => {
+    const blocks = buildHome(model());
+    const [header, detail] = blocks;
+    expect((header?.text as { text: string }).text).toBe("🐑 Herd · personal");
+    // Directly under the title, and only once.
+    expect(detail?.type).toBe("context");
+    expect(JSON.stringify(detail)).toContain("pid `1234`");
+    expect(text(blocks).match(/pid /g)).toHaveLength(1);
+    expect(text(blocks)).not.toContain("*Herds*");
+  });
+
   it("pluralises the agent count correctly", () => {
     expect(text(buildHome(model()))).toContain("1 agent");
     expect(
       text(buildHome(model({ agents: [agent(), agent({ ref: "r2", actionValue: "r2" })] }))),
     ).toContain("2 agents");
+  });
+});
+
+describe("more than one herd", () => {
+  const work = herd({ herdId: "work", label: "work", pid: 111, agentCount: 2 });
+  const personal = herd({
+    herdId: "personal",
+    label: "personal",
+    pid: 222,
+    agentCount: 1,
+    isLocal: false,
+    user: "ege",
+    hostname: "mac",
+    role: "satellite",
+  });
+  const workAgent = agent({ ref: "w1", actionValue: "w1", herdId: "work", herdLabel: "work" });
+  const personalAgent = agent({
+    ref: "p1",
+    actionValue: "personal\u001fp1",
+    terminalId: "term_p",
+    title: "personal task",
+    herdId: "personal",
+    herdLabel: "personal",
+  });
+
+  const twoHerds = (overrides: Partial<HomeModel> = {}) =>
+    model({
+      herds: [work, personal],
+      localHerdId: "work",
+      agents: [workAgent, personalAgent],
+      ...overrides,
+    });
+
+  it("opens on an overview of every herd, not one herd's agents", () => {
+    const rendered = text(buildHome(twoHerds()));
+    expect(rendered).toContain("🐑 Herds · 2");
+    expect(rendered).toContain("pid `111`");
+    expect(rendered).toContain("pid `222`");
+    // The agent list belongs to the drill-down, not the overview.
+    expect(rendered).not.toContain("*project*");
+  });
+
+  it("offers each herd as a way in", () => {
+    const rendered = text(buildHome(twoHerds()));
+    expect(rendered).toContain('"action_id":"home_select_herd","value":"work"');
+    expect(rendered).toContain('"action_id":"home_select_herd","value":"personal"');
+  });
+
+  it("says which herd needs you from the overview", () => {
+    const rendered = text(
+      buildHome(
+        twoHerds({
+          agents: [workAgent, { ...personalAgent, status: "blocked" }],
+        }),
+      ),
+    );
+    expect(rendered).toContain("1 waiting on you");
+    expect(rendered).toContain("NEEDS YOU (1)");
+  });
+
+  it("shows only the selected herd's agents once you drill in", () => {
+    const rendered = text(buildHome(twoHerds({ selectedHerdId: "personal" })));
+    expect(rendered).toContain("🐑 Herd · personal");
+    expect(rendered).toContain("personal task");
+    expect(rendered).not.toContain("a task");
+    // And a way back out.
+    expect(rendered).toContain(`"value":"${ALL_HERDS}"`);
+  });
+
+  it("routes a foreign agent's Open through its own herd", () => {
+    const rendered = text(buildHome(twoHerds({ selectedHerdId: "personal" })));
+    expect(rendered).toContain("personal\\u001fp1");
+  });
+
+  it("skips the overview when there is only one herd to choose", () => {
+    // An extra tap to see your only machine is pure friction.
+    const rendered = text(buildHome(model()));
+    expect(rendered).toContain("🐑 Herd · personal");
+    expect(rendered).not.toContain(ALL_HERDS);
+  });
+
+  it("keeps New agent while one herd is reachable, even if another is asleep", () => {
+    const rendered = text(
+      buildHome(twoHerds({ herds: [work, { ...personal, herdrStatus: "waiting" }] })),
+    );
+    expect(rendered).toContain("home_new_agent");
+    expect(rendered).toContain("herdr down");
+  });
+
+  it("drops New agent when the herd you are looking at is asleep", () => {
+    const rendered = text(
+      buildHome(
+        twoHerds({
+          herds: [work, { ...personal, herdrStatus: "waiting" }],
+          selectedHerdId: "personal",
+        }),
+      ),
+    );
+    expect(rendered).not.toContain("home_new_agent");
+    expect(rendered).toContain("not reachable");
+  });
+
+  it("explains an empty registry rather than rendering a bare header", () => {
+    const rendered = text(buildHome(model({ herds: [], agents: [] })));
+    expect(rendered).toContain("No herds are reporting in");
   });
 });
 

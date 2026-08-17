@@ -132,19 +132,33 @@ any problems below are what a real start would refuse on — this run continues 
 
   // Elect Slack ownership before opening Socket Mode — two Socket Mode clients
   // on the same app race for events and overwrite App Home.
-  const herdRegistryDir =
-    config.herdRegistryDir ??
-    (scratch ? path.join(scratch, "herd-registry") : defaultHerdRegistryDir(configDir()));
+  // A dry run must touch nothing the real install shares (ADR 0007), so it gets
+  // an isolated registry under the scratch dir even when a real one is
+  // configured — otherwise it would advertise a phantom herd to live daemons.
+  const herdRegistryDir = scratch
+    ? path.join(scratch, "herd-registry")
+    : (config.herdRegistryDir ?? defaultHerdRegistryDir(configDir()));
   const herd = new HerdBridge({
     config,
     instance,
     state,
     tail,
     registry,
+    client,
     log: (line) => log.event("surface", { msg: line }),
     registryDir: herdRegistryDir,
+    // Ownership is only taken during election, so becoming primary means
+    // starting over. Exiting non-zero is what makes the service manager do it.
+    onPromotable: () => {
+      log.event("daemon.restart_for_ownership", { herdId: herd.herdId });
+      process.exit(1);
+    },
   });
-  const role = dryRun ? "primary" : await herd.elect();
+  // Always elect: in a dry run the scratch registry has no other herd, so this
+  // returns primary — but skipping it left the bridge thinking it was a
+  // satellite with no owner, which now (correctly) tries to restart for
+  // ownership and would kill the dry run.
+  const role = await herd.elect();
 
   const transport: SlackTransport = dryRun
     ? new DryRunTransport((write) => {

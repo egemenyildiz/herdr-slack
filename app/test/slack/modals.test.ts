@@ -27,10 +27,18 @@ const worktree = (overrides: Partial<WorktreeInfo> = {}): WorktreeInfo => ({
   ...overrides,
 });
 
+const asTargets = (workspaces: WorkspaceInfo[], worktrees: WorktreeInfo[]) => ({
+  workspaces: workspaces.map((w) => ({ id: w.workspace_id, label: w.label || w.workspace_id })),
+  worktrees: worktrees.map((tree) => ({
+    label: tree.label,
+    path: tree.path,
+    ...(tree.branch ? { branch: tree.branch } : {}),
+  })),
+});
+
 const model = (overrides = {}) => ({
-  workspaces: [workspace({ label: "posi" })],
-  worktrees: [worktree()],
-  catalog: SEED_CATALOG,
+  ...asTargets([workspace({ label: "posi" })], [worktree()]),
+  kinds: SEED_CATALOG.map((entry) => ({ kind: entry.kind, label: entry.label })),
   ...overrides,
 });
 
@@ -130,8 +138,11 @@ describe("session modals", () => {
 describe("buildNewAgentModal", () => {
   it("offers every field the launch needs", () => {
     const rendered = json(buildNewAgentModal(model()));
-    // Mode is deliberately absent — Slack always launches in auto.
-    const shown = Object.entries(BLOCK_IDS).filter(([name]) => name !== "mode" && name !== "reply");
+    // Mode is deliberately absent — Slack always launches in auto. Herd only
+    // appears when there is more than one to choose between.
+    const shown = Object.entries(BLOCK_IDS).filter(
+      ([name]) => name !== "mode" && name !== "reply" && name !== "herd",
+    );
     for (const [, id] of shown) {
       expect(rendered).toContain(id);
     }
@@ -205,7 +216,7 @@ describe("buildNewAgentModal", () => {
     const many: WorkspaceInfo[] = Array.from({ length: 250 }, (_, i) =>
       workspace({ workspace_id: `w${i}`, label: `ws ${i}` }),
     );
-    const view = buildNewAgentModal(model({ workspaces: many }));
+    const view = buildNewAgentModal(model({ workspaces: asTargets(many, []).workspaces }));
     const block = (view.blocks as Record<string, unknown>[]).find(
       (b) => b.block_id === BLOCK_IDS.workspace,
     );
@@ -215,9 +226,50 @@ describe("buildNewAgentModal", () => {
 
   it("never emits an empty option label", () => {
     const view = buildNewAgentModal(
-      model({ workspaces: [workspace({ label: "", workspace_id: "w9" })] }),
+      model({
+        workspaces: asTargets([workspace({ label: "", workspace_id: "w9" })], []).workspaces,
+      }),
     );
     expect(json(view)).not.toContain('"text":""');
+  });
+
+  it("puts the herd first when there is more than one, and remembers the choice", () => {
+    // Everything below the herd belongs to it, so picking it later would mean
+    // re-picking the workspace and directory.
+    const view = buildNewAgentModal(
+      model({
+        herds: [
+          { herdId: "h1", label: "work", agentCount: 3, reachable: true },
+          { herdId: "h2", label: "personal", agentCount: 1, reachable: true },
+        ],
+        selectedHerdId: "h2",
+      }),
+    );
+    const ids = (view.blocks as { block_id: string }[]).map((b) => b.block_id);
+    expect(ids[0]).toBe(BLOCK_IDS.herd);
+    expect(ids.indexOf(BLOCK_IDS.herd)).toBeLessThan(ids.indexOf(BLOCK_IDS.workspace));
+    expect(view.private_metadata).toBe("h2");
+    expect(json(view)).toContain("work (3 agents)");
+  });
+
+  it("omits the herd picker when there is only one place to launch", () => {
+    const view = buildNewAgentModal(
+      model({ herds: [{ herdId: "h1", label: "work", agentCount: 3, reachable: true }] }),
+    );
+    const ids = (view.blocks as { block_id: string }[]).map((b) => b.block_id);
+    expect(ids).not.toContain(BLOCK_IDS.herd);
+  });
+
+  it("marks an unreachable herd rather than hiding it", () => {
+    const view = buildNewAgentModal(
+      model({
+        herds: [
+          { herdId: "h1", label: "work", agentCount: 3, reachable: true },
+          { herdId: "h2", label: "asleep", agentCount: 0, reachable: false },
+        ],
+      }),
+    );
+    expect(json(view)).toContain("asleep — unreachable");
   });
 });
 

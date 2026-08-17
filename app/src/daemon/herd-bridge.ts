@@ -4,8 +4,11 @@
 
 import { randomBytes } from "node:crypto";
 import os from "node:os";
+import { autoModeFor, findEntry, loadCatalog } from "../agents/catalog.js";
+import { launchAgent, sanitizeAgentName } from "../agents/launcher.js";
 import type { InstanceConfig } from "../config/config.js";
 import { configDir } from "../config/instance.js";
+import type { HerdrClient } from "../herdr/client.js";
 import type { EventTail, TailStatus } from "../herdr/events.js";
 import type { SessionState } from "../herdr/state.js";
 import type { SessionRegistry } from "../registry/registry.js";
@@ -17,13 +20,20 @@ import {
   type HerdAgentSnapshot,
   type HerdCommand,
   type HerdHeartbeat,
+  type HerdLaunchOptions,
+  type HerdLaunchRequest,
   HerdRegistry,
+  OWNERSHIP_STALE_MS,
   defaultHerdRegistryDir,
   deriveHerdId,
   encodeHerdRef,
 } from "./herd-registry.js";
+import { registryKey } from "./herd-signing.js";
 
 export type SlackRole = "primary" | "satellite";
+
+/** Cap on agents advertised to peers, so one busy herd cannot bloat the file. */
+const MAX_ADVERTISED_AGENTS = 40;
 
 export interface HerdBridgeDeps {
   config: InstanceConfig;
@@ -31,7 +41,21 @@ export interface HerdBridgeDeps {
   state: SessionState;
   tail: EventTail;
   registry: SessionRegistry;
+  client: HerdrClient;
   log: (line: string) => void;
+  /**
+   * Called when this satellite could take Slack ownership but cannot without a
+   * restart. Swapping the transport in place would mean rebuilding every
+   * handler mid-flight; the service manager restarting us is simpler and the
+   * election on startup is the only place ownership is taken.
+   */
+  onPromotable?: () => void;
+  /**
+   * A dry run takes no part in ownership: it must not claim Slack from the real
+   * daemon, must not demote it, and must not restart itself to take over a seat
+   * it is only pretending to hold.
+   */
+  dryRun?: boolean;
   /** Override for tests. */
   registryDir?: string;
   herdId?: string;
@@ -45,12 +69,19 @@ export class HerdBridge {
   #commandTimer: NodeJS.Timeout | null = null;
   #stopped = false;
   #sessions: SessionController | null = null;
+  #promotionAnnounced = false;
+  /** Cached worktrees, refreshed on the heartbeat tick for peers' launch form. */
+  #worktrees: HerdLaunchOptions["worktrees"] = [];
 
   constructor(private readonly deps: HerdBridgeDeps) {
     this.herdId = deps.herdId ?? deriveHerdId(deps.instance);
     const dir =
       deps.registryDir ?? deps.config.herdRegistryDir ?? defaultHerdRegistryDir(configDir());
-    this.registry = new HerdRegistry(dir);
+    this.registry = new HerdRegistry(dir, registryKey(deps.config.slack.botToken), {
+      // An explicitly configured directory is the cross-account case, so peers
+      // running as other users have to be able to write into it.
+      shared: deps.config.herdRegistryDir !== undefined,
+    });
   }
 
   /** Called once Surfaces has constructed its SessionController. */
@@ -71,7 +102,7 @@ export class HerdBridge {
     });
     this.#role = won ? "primary" : "satellite";
     this.deps.log(
-      `herd ${this.herdId} is ${this.#role} for app ${this.deps.config.slack.appId} (registry ${this.registry.root})`,
+      `herd ${this.herdId} is ${this.#role} for app ${this.deps.config.slack.appId} (registry ${this.registry.root}, shared=${this.registry.shared})`,
     );
     return this.#role;
   }
@@ -98,8 +129,7 @@ export class HerdBridge {
 
   /** Snapshot for Home: every live herd on this Slack app. */
   homeHerds(): HomeHerd[] {
-    const peers = this.registry.listHeartbeats(this.deps.config.slack.appId);
-    return peers.map((peer) => ({
+    return this.registry.listHeartbeats(this.deps.config.slack.appId).map((peer) => ({
       herdId: peer.herdId,
       label: peer.label || peer.instance,
       pid: peer.pid,
@@ -142,6 +172,15 @@ export class HerdBridge {
     return merged;
   }
 
+  /** What a herd can launch into, for the New agent form. */
+  launchOptionsFor(herdId: string): HerdLaunchOptions | null {
+    if (herdId === this.herdId) return this.#localLaunchOptions();
+    const peer = this.registry
+      .listHeartbeats(this.deps.config.slack.appId)
+      .find((row) => row.herdId === herdId);
+    return peer?.launch ?? null;
+  }
+
   forwardCommand(input: {
     op: HerdCommand["op"];
     herdId: string;
@@ -149,9 +188,10 @@ export class HerdBridge {
     channel: string;
     userId: string;
     text?: string;
+    launch?: HerdLaunchRequest;
   }): string {
     const id = randomBytes(8).toString("hex");
-    const command: HerdCommand = {
+    this.registry.enqueueCommand({
       id,
       op: input.op,
       herdId: input.herdId,
@@ -160,50 +200,78 @@ export class HerdBridge {
       userId: input.userId,
       createdAt: Date.now(),
       ...(input.text !== undefined ? { text: input.text } : {}),
-    };
-    this.registry.enqueueCommand(command);
+      ...(input.launch !== undefined ? { launch: input.launch } : {}),
+    });
     return id;
   }
 
   async #tick(): Promise<void> {
     if (this.#stopped) return;
+    const appId = this.deps.config.slack.appId;
     if (this.#role === "primary") {
-      this.registry.renewOwnership(this.deps.config.slack.appId, this.herdId, process.pid);
-      // Re-elect if we somehow lost ownership (another primary came up fresher).
-      const owner = this.registry.readOwnership(this.deps.config.slack.appId);
+      this.registry.renewOwnership(appId, this.herdId, process.pid);
+      const owner = this.registry.readOwnership(appId);
       if (owner && owner.herdId !== this.herdId) {
         this.deps.log(`lost Slack ownership to ${owner.herdId}; becoming satellite`);
         this.#role = "satellite";
       }
     } else {
-      const won = await this.registry.claimOwnership({
-        appId: this.deps.config.slack.appId,
-        herdId: this.herdId,
-        pid: process.pid,
-      });
-      if (won && this.#role === "satellite") {
-        this.deps.log("claimed Slack ownership; restart daemon to become primary Socket Mode");
-        // Stay satellite until restart — flipping Socket Mode live is unsafe.
+      // Deliberately does not claim: taking ownership without owning Socket
+      // Mode would demote the real primary on its next tick and leave Slack
+      // with no owner at all. Ownership is only ever taken during election.
+      const owner = this.registry.readOwnership(appId);
+      const ownerless = !owner || Date.now() - owner.updatedAt > OWNERSHIP_STALE_MS;
+      if (ownerless && !this.#promotionAnnounced) {
+        this.#promotionAnnounced = true;
+        this.deps.log("no live Slack owner for this app; restarting to take it over");
+        this.deps.onPromotable?.();
+      } else if (!ownerless) {
+        this.#promotionAnnounced = false;
       }
     }
 
-    const agents = this.#snapshotAgents();
-    const heartbeat: HerdHeartbeat = {
+    await this.#refreshWorktrees();
+    this.registry.writeHeartbeat({
       herdId: this.herdId,
       label: this.deps.config.label || this.deps.instance,
       pid: process.pid,
       instance: this.deps.instance,
       socketPath: this.deps.config.herdrSocketPath,
-      appId: this.deps.config.slack.appId,
+      appId,
       teamId: this.deps.config.slack.teamId,
       herdrStatus: this.deps.tail.status as TailStatus,
-      agents,
+      agents: this.#snapshotAgents(),
       updatedAt: Date.now(),
       role: this.#role,
       hostname: os.hostname(),
       user: os.userInfo().username,
+      launch: this.#localLaunchOptions(),
+    } satisfies HerdHeartbeat);
+  }
+
+  async #refreshWorktrees(): Promise<void> {
+    if (this.deps.tail.status !== "connected") return;
+    try {
+      const worktrees = await this.deps.client.worktreeList();
+      this.#worktrees = worktrees.map((tree) => ({
+        label: tree.label,
+        path: tree.path,
+        ...(tree.branch ? { branch: tree.branch } : {}),
+      }));
+    } catch {
+      // Keep the last known list; the form degrades to typing a path.
+    }
+  }
+
+  #localLaunchOptions(): HerdLaunchOptions {
+    return {
+      workspaces: [...this.deps.state.workspaces.values()].map((workspace) => ({
+        id: workspace.workspace_id,
+        label: workspace.label || workspace.workspace_id,
+      })),
+      worktrees: this.#worktrees,
+      kinds: loadCatalog().map((entry) => ({ kind: entry.kind, label: entry.label })),
     };
-    this.registry.writeHeartbeat(heartbeat);
   }
 
   #snapshotAgents(): HerdAgentSnapshot[] {
@@ -230,7 +298,7 @@ export class HerdBridge {
         workspaceLabel: agent.workspaceLabel,
         ...(agent.permalink ? { permalink: agent.permalink } : {}),
       });
-      if (out.length >= 40) break;
+      if (out.length >= MAX_ADVERTISED_AGENTS) break;
     }
     return out;
   }
@@ -258,6 +326,12 @@ export class HerdBridge {
   async #runCommand(command: HerdCommand): Promise<string | undefined> {
     const sessions = this.#sessions;
     if (!sessions) return "Session controller not ready.";
+    if (this.deps.tail.status !== "connected") return "That herd's herdr is not connected.";
+
+    if (command.op === "launch_agent") {
+      return this.#runLaunch(command);
+    }
+
     const terminalId = this.deps.registry.terminalForRef(command.ref);
     if (!terminalId) return "That agent is no longer on this herd.";
 
@@ -284,13 +358,32 @@ export class HerdBridge {
         void sessions.updateCard(terminalId);
         return undefined;
       }
-      case "menu_choice": {
-        // Satellite menu choices are handled by the session controller path when
-        // we add key send; for now refuse clearly.
-        return "Menu choices on a satellite herd are not supported yet.";
-      }
       default:
         return "Unknown command.";
     }
+  }
+
+  async #runLaunch(command: HerdCommand): Promise<string | undefined> {
+    const request = command.launch;
+    if (!request?.kind) return "Missing agent kind.";
+    // Always auto mode: a remote launch cannot answer a permission prompt.
+    const mode = autoModeFor(findEntry(loadCatalog(), request.kind));
+    const result = await launchAgent(this.deps.client, {
+      kind: request.kind,
+      mode,
+      name: sanitizeAgentName(request.label ?? request.kind),
+      ...(request.workspaceId ? { workspaceId: request.workspaceId } : {}),
+      ...(request.cwd ? { cwd: request.cwd } : {}),
+      ...(request.label ? { label: request.label } : {}),
+      ...(request.firstPrompt ? { firstPrompt: request.firstPrompt } : {}),
+    });
+    this.deps.log(
+      `remote launch ${request.kind} → ${result.ok ? "ok" : "failed"} pane=${result.paneId ?? "?"}`,
+    );
+    if (!result.ok) return result.message ?? `Could not start ${request.kind}.`;
+    if (result.promptDelivered === false) {
+      return `Started ${request.kind}, but the first prompt did not reach it — open it and use Reply.`;
+    }
+    return undefined;
   }
 }

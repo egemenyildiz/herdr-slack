@@ -6,9 +6,14 @@
  * and take work from the command queue. The directory can live on the same
  * machine (including `/Users/Shared/...` across macOS accounts) or on a mount
  * reachable from a remote host — the format does not care where herdr runs.
+ *
+ * Every record is sealed (see herd-signing.ts). A shared directory is writable
+ * by other local accounts, and an unauthenticated command queue would let any
+ * of them type into a terminal.
  */
 
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -22,6 +27,7 @@ import path from "node:path";
 import lockfile from "proper-lockfile";
 import type { TailStatus } from "../herdr/events.js";
 import type { AgentStatus } from "../herdr/types.js";
+import { seal, unseal } from "./herd-signing.js";
 
 /** How long a heartbeat may sit before the herd is treated as gone. */
 export const HEARTBEAT_STALE_MS = 20_000;
@@ -29,6 +35,8 @@ export const HEARTBEAT_STALE_MS = 20_000;
 export const HEARTBEAT_INTERVAL_MS = 5_000;
 /** Ownership is reclaimed if the primary stops refreshing. */
 export const OWNERSHIP_STALE_MS = 25_000;
+/** A queued command this old is abandoned rather than executed late. */
+export const COMMAND_STALE_MS = 60_000;
 
 export interface HerdAgentSnapshot {
   ref: string;
@@ -39,6 +47,13 @@ export interface HerdAgentSnapshot {
   status: AgentStatus;
   workspaceLabel: string;
   permalink?: string;
+}
+
+/** What a peer needs in order to render our New agent form. */
+export interface HerdLaunchOptions {
+  workspaces: { id: string; label: string }[];
+  worktrees: { label: string; path: string; branch?: string }[];
+  kinds: { kind: string; label: string }[];
 }
 
 export interface HerdHeartbeat {
@@ -56,6 +71,7 @@ export interface HerdHeartbeat {
   role: "primary" | "satellite";
   hostname: string;
   user: string;
+  launch?: HerdLaunchOptions;
 }
 
 export interface SlackOwnership {
@@ -65,7 +81,15 @@ export interface SlackOwnership {
   updatedAt: number;
 }
 
-export type HerdCommandOp = "open_session" | "refresh" | "end_session" | "prompt" | "menu_choice";
+export type HerdCommandOp = "open_session" | "refresh" | "end_session" | "prompt" | "launch_agent";
+
+export interface HerdLaunchRequest {
+  kind: string;
+  workspaceId?: string;
+  cwd?: string;
+  label?: string;
+  firstPrompt?: string;
+}
 
 export interface HerdCommand {
   id: string;
@@ -74,8 +98,9 @@ export interface HerdCommand {
   ref: string;
   channel: string;
   userId: string;
-  /** Prompt text or menu digit, when relevant. */
+  /** Prompt text, when relevant. */
   text?: string;
+  launch?: HerdLaunchRequest;
   createdAt: number;
 }
 
@@ -116,16 +141,58 @@ export function decodeHerdRef(value: string, localHerdId: string): { herdId: str
   return { herdId: value.slice(0, separator), ref: value.slice(separator + 1) };
 }
 
+export interface HerdRegistryOptions {
+  /**
+   * Whether peers running as other OS users must be able to write here.
+   *
+   * Shared mode widens the directory and file modes, and has to chmod
+   * explicitly because the process umask masks the mode passed to mkdir/write.
+   * Private mode keeps the 0700/0600 the rest of our state uses.
+   */
+  shared?: boolean;
+}
+
 export class HerdRegistry {
-  constructor(readonly root: string) {
-    mkdirSync(this.#heartbeatsDir(), { recursive: true, mode: 0o777 });
-    mkdirSync(this.#commandsDir(), { recursive: true, mode: 0o777 });
-    mkdirSync(this.#resultsDir(), { recursive: true, mode: 0o777 });
-    // Cross-account Shared dirs need to stay group/world-writable for peers.
-    try {
-      writeFileSync(path.join(this.root, ".writable"), `${Date.now()}\n`, { mode: 0o666 });
-    } catch {
-      // Read-only mounts still allow reading peer heartbeats.
+  readonly shared: boolean;
+
+  constructor(
+    readonly root: string,
+    private readonly key: Buffer,
+    options: HerdRegistryOptions = {},
+  ) {
+    this.shared = options.shared === true;
+    for (const dir of [this.root, this.#heartbeatsDir(), this.#commandsDir(), this.#resultsDir()]) {
+      this.#ensureDir(dir);
+    }
+  }
+
+  #dirMode(): number {
+    return this.shared ? 0o777 : 0o700;
+  }
+
+  #fileMode(): number {
+    return this.shared ? 0o666 : 0o600;
+  }
+
+  #ensureDir(dir: string): void {
+    mkdirSync(dir, { recursive: true, mode: this.#dirMode() });
+    if (this.shared) {
+      try {
+        chmodSync(dir, this.#dirMode());
+      } catch {
+        // Someone else created it with workable modes, or we do not own it.
+      }
+    }
+  }
+
+  #write(file: string, record: unknown): void {
+    writeFileSync(file, `${JSON.stringify(seal(this.key, record))}\n`, { mode: this.#fileMode() });
+    if (this.shared) {
+      try {
+        chmodSync(file, this.#fileMode());
+      } catch {
+        // Not ours to chmod; the write above already succeeded.
+      }
     }
   }
 
@@ -151,18 +218,19 @@ export class HerdRegistry {
 
   writeHeartbeat(heartbeat: HerdHeartbeat): void {
     const file = path.join(this.#heartbeatsDir(), `${sanitize(heartbeat.herdId)}.json`);
+    // Written via rename so a reader never sees a half-written heartbeat.
     const tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(heartbeat)}\n`, { mode: 0o666 });
+    this.#write(tmp, heartbeat);
     renameSync(tmp, file);
   }
 
-  /** Live heartbeats for this Slack app, freshest first. */
+  /** Live, verified heartbeats for this Slack app, freshest first. */
   listHeartbeats(appId: string, now = Date.now()): HerdHeartbeat[] {
     if (!existsSync(this.#heartbeatsDir())) return [];
     const rows: HerdHeartbeat[] = [];
     for (const name of readdirSync(this.#heartbeatsDir())) {
       if (!name.endsWith(".json")) continue;
-      const parsed = this.#readJson<HerdHeartbeat>(path.join(this.#heartbeatsDir(), name));
+      const parsed = this.#read<HerdHeartbeat>(path.join(this.#heartbeatsDir(), name));
       if (!parsed) continue;
       if (parsed.appId !== appId) continue;
       if (now - parsed.updatedAt > HEARTBEAT_STALE_MS) continue;
@@ -194,7 +262,7 @@ export class HerdRegistry {
   }): Promise<boolean> {
     const now = input.now ?? Date.now();
     const lockTarget = this.#ownershipLockPath(input.appId);
-    if (!existsSync(lockTarget)) writeFileSync(lockTarget, "", { mode: 0o666 });
+    if (!existsSync(lockTarget)) this.#write(lockTarget, { lock: input.appId });
 
     let release: (() => Promise<void>) | undefined;
     try {
@@ -215,17 +283,16 @@ export class HerdRegistry {
         current &&
         current.herdId !== input.herdId &&
         now - current.updatedAt < OWNERSHIP_STALE_MS &&
-        isPidAlive(current.pid)
+        isPidAlive(current.pid, current.herdId, input.herdId)
       ) {
         return false;
       }
-      const next: SlackOwnership = {
+      this.#write(this.#ownershipPath(input.appId), {
         herdId: input.herdId,
         pid: input.pid,
         appId: input.appId,
         updatedAt: now,
-      };
-      writeFileSync(this.#ownershipPath(input.appId), `${JSON.stringify(next)}\n`, { mode: 0o666 });
+      } satisfies SlackOwnership);
       return true;
     } finally {
       await release?.();
@@ -236,33 +303,43 @@ export class HerdRegistry {
   renewOwnership(appId: string, herdId: string, pid: number, now = Date.now()): void {
     const current = this.readOwnership(appId);
     if (!current || current.herdId !== herdId) return;
-    writeFileSync(
-      this.#ownershipPath(appId),
-      `${JSON.stringify({ ...current, pid, updatedAt: now })}\n`,
-      { mode: 0o666 },
-    );
+    this.#write(this.#ownershipPath(appId), { ...current, pid, updatedAt: now });
   }
 
   readOwnership(appId: string): SlackOwnership | null {
-    return this.#readJson<SlackOwnership>(this.#ownershipPath(appId));
+    return this.#read<SlackOwnership>(this.#ownershipPath(appId));
   }
 
   enqueueCommand(command: HerdCommand): void {
     const dir = path.join(this.#commandsDir(), sanitize(command.herdId));
-    mkdirSync(dir, { recursive: true, mode: 0o777 });
-    const file = path.join(dir, `${sanitize(command.id)}.json`);
-    writeFileSync(file, `${JSON.stringify(command)}\n`, { mode: 0o666 });
+    this.#ensureDir(dir);
+    this.#write(path.join(dir, `${sanitize(command.id)}.json`), command);
   }
 
-  /** Pending commands for a satellite, oldest first. */
-  listCommands(herdId: string): HerdCommand[] {
+  /** Pending, verified commands for a herd, oldest first. */
+  listCommands(herdId: string, now = Date.now()): HerdCommand[] {
     const dir = path.join(this.#commandsDir(), sanitize(herdId));
     if (!existsSync(dir)) return [];
     const rows: HerdCommand[] = [];
     for (const name of readdirSync(dir)) {
       if (!name.endsWith(".json")) continue;
-      const parsed = this.#readJson<HerdCommand>(path.join(dir, name));
-      if (parsed) rows.push(parsed);
+      const file = path.join(dir, name);
+      const parsed = this.#read<HerdCommand>(file);
+      if (!parsed) {
+        // Unverifiable: forged, corrupt, or from a daemon on another app.
+        continue;
+      }
+      // A command that sat through a daemon restart is not worth replaying;
+      // the person who pressed the button has long since moved on.
+      if (now - parsed.createdAt > COMMAND_STALE_MS) {
+        try {
+          unlinkSync(file);
+        } catch {
+          // best effort
+        }
+        continue;
+      }
+      rows.push(parsed);
     }
     return rows.sort((a, b) => a.createdAt - b.createdAt);
   }
@@ -278,13 +355,15 @@ export class HerdRegistry {
     } catch {
       // already claimed
     }
-    const out = path.join(this.#resultsDir(), `${sanitize(command.id)}.json`);
-    writeFileSync(out, `${JSON.stringify({ id: command.id, ...result })}\n`, { mode: 0o666 });
+    this.#write(path.join(this.#resultsDir(), `${sanitize(command.id)}.json`), {
+      id: command.id,
+      ...result,
+    });
   }
 
   takeResult(commandId: string): HerdCommandResult | null {
     const file = path.join(this.#resultsDir(), `${sanitize(commandId)}.json`);
-    const parsed = this.#readJson<HerdCommandResult>(file);
+    const parsed = this.#read<HerdCommandResult>(file);
     if (!parsed) return null;
     try {
       unlinkSync(file);
@@ -294,10 +373,10 @@ export class HerdRegistry {
     return parsed;
   }
 
-  #readJson<T>(file: string): T | null {
+  #read<T>(file: string): T | null {
     if (!existsSync(file)) return null;
     try {
-      return JSON.parse(readFileSync(file, "utf8")) as T;
+      return unseal<T>(this.key, JSON.parse(readFileSync(file, "utf8")));
     } catch {
       return null;
     }
@@ -308,12 +387,22 @@ function sanitize(value: string): string {
   return value.replace(/[^A-Za-z0-9._:-]+/g, "_");
 }
 
-function isPidAlive(pid: number): boolean {
+/**
+ * Whether the recorded owner is still running.
+ *
+ * `process.kill(pid, 0)` only answers for our own machine, and it answers
+ * "no such process" for a pid owned by another user only when it truly is gone
+ * — EPERM means alive. A herd on a different host cannot be probed at all, so
+ * a foreign host's claim is trusted until its timestamp goes stale.
+ */
+function isPidAlive(pid: number, ownerHerdId: string, selfHerdId: string): boolean {
+  const sameHost = ownerHerdId.split(":")[0] === selfHerdId.split(":")[0];
+  if (!sameHost) return true;
   if (!pid || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
