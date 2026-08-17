@@ -3,6 +3,13 @@ name: release
 on:
   push:
     branches: [main]
+  # Retrying by hand matters because release-please keeps its state in the
+  # release PR's labels. If a run dies after tagging but before it can swap
+  # `autorelease: pending` for `autorelease: tagged` — a cancelled run, or the
+  # billing block that stopped every job here on 2026-08-16 — then every later
+  # run retries the same release and fails with "Duplicate release tag". Without
+  # a manual trigger the only way out is an empty commit.
+  workflow_dispatch:
 
 permissions:
   contents: write
