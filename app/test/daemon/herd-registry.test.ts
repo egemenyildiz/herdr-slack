@@ -115,6 +115,43 @@ describe("HerdRegistry ownership", () => {
     expect(registry.readOwnership("A1")?.herdId).toBe("h2");
   });
 
+  it("recreates a wiped heartbeats directory instead of crashing", () => {
+    // A peer (or `rm -rf /Users/Shared/herdr-slack`) can remove the tree between
+    // ticks. A failed write used to escape #tick as an unhandledRejection and
+    // kill the daemon — exactly the outage that left Slack with no owner.
+    const dir = scratch();
+    const registry = openRegistry(dir);
+    const heartbeat = {
+      herdId: "h1",
+      label: "work",
+      pid: 1,
+      instance: "default",
+      socketPath: "/tmp/a.sock",
+      appId: "A1",
+      teamId: "T1",
+      herdrStatus: "connected" as const,
+      agents: [],
+      updatedAt: Date.now(),
+      role: "primary" as const,
+      hostname: "mac",
+      user: "a",
+    };
+    registry.writeHeartbeat(heartbeat);
+    rmSync(path.join(dir, "heartbeats"), { recursive: true, force: true });
+    registry.writeHeartbeat({ ...heartbeat, updatedAt: Date.now() });
+    expect(registry.listHeartbeats("A1").map((row) => row.herdId)).toEqual(["h1"]);
+  });
+
+  it("recreates a wiped ownership file's parent on renew", async () => {
+    const dir = scratch();
+    const registry = openRegistry(dir);
+    await registry.claimOwnership({ appId: "A1", herdId: "h1", pid: process.pid });
+    rmSync(dir, { recursive: true, force: true });
+    // Must not throw — same survival property as the heartbeat path.
+    registry.renewOwnership("A1", "h1", process.pid);
+    expect(registry.readOwnership("A1")?.herdId).toBe("h1");
+  });
+
   it("aggregates fresh heartbeats for one app only", () => {
     const registry = openRegistry();
     const base = {

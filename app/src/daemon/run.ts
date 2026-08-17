@@ -23,7 +23,7 @@ import { WebApiTransport } from "../slack/web-api-transport.js";
 import { RateBudget } from "./budget.js";
 import { HerdBridge } from "./herd-bridge.js";
 import { Logger } from "./logger.js";
-import { acquireLock, onShutdown, writeRecord } from "./supervisor.js";
+import { acquireLock, installProcessGuards, onShutdown, writeRecord } from "./supervisor.js";
 
 const VERSION = "0.1.0";
 
@@ -88,6 +88,10 @@ export function redirectStateToScratch(): string {
 export async function runDaemon(instance: string, options: RunOptions = {}): Promise<number> {
   const dryRun = options.dryRun === true;
   const log = new Logger(instance);
+  // Before anything else can schedule work: a rejection from a tick or a Slack
+  // handler must not take the process down, and a true crash must exit 1 so
+  // KeepAlive / Restart=on-failure bring us back.
+  installProcessGuards(log);
   const scratch = dryRun ? redirectStateToScratch() : null;
   if (scratch) {
     process.stdout.write(`dry run: nothing is sent to Slack; state is scoped to ${scratch}

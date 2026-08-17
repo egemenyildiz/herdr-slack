@@ -87,6 +87,13 @@ Security-sensitive; breaking these is a security bug.
 - **Ownership is only taken during election.** A satellite that claimed it mid-flight would demote
   the real primary on its next tick and leave Slack with no owner at all, so a satellite that sees no
   live owner exits non-zero and lets the service manager restart it into an election.
+- **A failed heartbeat must not kill the daemon.** The shared registry can vanish between ticks
+  (another account resets it, a tmp reaper, a wipe during QA). Every write re-ensures its parent
+  directory, and `#tick` swallows I/O errors so they cannot escape as `unhandledRejection`. A stray
+  rejection from anywhere else is logged and kept alive; only an `uncaughtException` exits 1, which
+  is what launchd `KeepAlive={SuccessfulExit:false}` / systemd `Restart=on-failure` need in order to
+  bring the process back. Intentional stops (`SIGINT`/`SIGTERM` via `daemon stop`) still exit 0 so
+  the service manager does not bounce.
 - Home is a **two-level view** when more than one herd reports in: an overview of herds with their
   agent counts, then one herd's agents. A single herd skips the overview.
 - `Surfaces` depends on **`HerdPort`**, not on `HerdBridge`, so the multi-herd paths are testable

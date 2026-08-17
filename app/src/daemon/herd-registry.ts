@@ -186,6 +186,9 @@ export class HerdRegistry {
   }
 
   #write(file: string, record: unknown): void {
+    // Recreate the parent every time: a peer (or a reset) can wipe the shared
+    // tree between ticks, and a failed heartbeat must never take the daemon down.
+    this.#ensureDir(path.dirname(file));
     writeFileSync(file, `${JSON.stringify(seal(this.key, record))}\n`, { mode: this.#fileMode() });
     if (this.shared) {
       try {
@@ -302,8 +305,16 @@ export class HerdRegistry {
   /** Refresh the ownership timestamp while remaining primary. */
   renewOwnership(appId: string, herdId: string, pid: number, now = Date.now()): void {
     const current = this.readOwnership(appId);
-    if (!current || current.herdId !== herdId) return;
-    this.#write(this.#ownershipPath(appId), { ...current, pid, updatedAt: now });
+    // Someone else holds it — leave it alone; election is the only place a
+    // claim is taken from another herd. Missing is different: a wipe of the
+    // shared tree must not leave Slack ownerless until the next restart.
+    if (current && current.herdId !== herdId) return;
+    this.#write(this.#ownershipPath(appId), {
+      herdId,
+      pid,
+      appId,
+      updatedAt: now,
+    } satisfies SlackOwnership);
   }
 
   readOwnership(appId: string): SlackOwnership | null {

@@ -139,7 +139,8 @@ export function spawnDetached(instance: string, execPath = process.execPath): nu
  * Exiting 0 on an intentional stop matters on both platforms: launchd's
  * KeepAlive={SuccessfulExit:false} and systemd's Restart=on-failure both treat a
  * clean exit as "do not restart". Exiting non-zero here would make `daemon stop`
- * silently bounce.
+ * silently bounce. Every other death must exit non-zero so the service manager
+ * brings the daemon back — that is what `installProcessGuards` enforces.
  */
 export function onShutdown(handler: () => Promise<void> | void): void {
   let shuttingDown = false;
@@ -156,4 +157,39 @@ export function onShutdown(handler: () => Promise<void> | void): void {
   };
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
+}
+
+export interface ProcessGuardLog {
+  error(event: string, fields?: Record<string, unknown>): void;
+}
+
+/**
+ * Keep the daemon alive through stray async failures, and die loudly for the
+ * ones that leave process state undefined.
+ *
+ * Node's default for an unhandled rejection is to crash. That is how a wiped
+ * shared registry (or a Bolt frame handler rejecting with `undefined`) left
+ * Slack with no Socket Mode owner and a `KeepAlive` that would not restart —
+ * launchd recorded exit 0 after a prior clean stop, and the crash path never
+ * got another chance. Logging and continuing is the right call for a rejection:
+ * the tick that failed will try again. An uncaught sync exception is different;
+ * exit 1 so the service manager restarts into a clean process.
+ */
+export function installProcessGuards(log: ProcessGuardLog): void {
+  process.on("unhandledRejection", (reason) => {
+    const message =
+      reason instanceof Error
+        ? reason.message
+        : reason === undefined
+          ? "undefined"
+          : String(reason);
+    log.error("daemon.unhandled_rejection", { message });
+  });
+  process.on("uncaughtException", (error) => {
+    log.error("daemon.uncaught_exception", {
+      message: error.message,
+      ...(error.name ? { name: error.name } : {}),
+    });
+    process.exit(1);
+  });
 }

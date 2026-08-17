@@ -1,9 +1,10 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   acquireLock,
+  installProcessGuards,
   isRunning,
   logPath,
   readRecord,
@@ -92,5 +93,68 @@ describe("daemon supervisor", () => {
   it("keeps state per instance", () => {
     expect(logPath("default")).toContain(path.join(dir, "default"));
     expect(logPath("sess-work")).toContain(path.join(dir, "sess-work"));
+  });
+});
+
+describe("installProcessGuards", () => {
+  const listeners = {
+    rejection: [] as NodeJS.UnhandledRejectionListener[],
+    exception: [] as NodeJS.UncaughtExceptionListener[],
+  };
+
+  beforeEach(() => {
+    listeners.rejection = [];
+    listeners.exception = [];
+    vi.spyOn(process, "on").mockImplementation(((
+      event: string,
+      listener: (...args: never[]) => void,
+    ) => {
+      if (event === "unhandledRejection") {
+        listeners.rejection.push(listener as NodeJS.UnhandledRejectionListener);
+      }
+      if (event === "uncaughtException") {
+        listeners.exception.push(listener as NodeJS.UncaughtExceptionListener);
+      }
+      return process;
+    }) as typeof process.on);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("logs an unhandled rejection and keeps the process alive", () => {
+    const errors: { event: string; fields: Record<string, unknown> }[] = [];
+    installProcessGuards({
+      error(event, fields = {}) {
+        errors.push({ event, fields });
+      },
+    });
+    expect(listeners.rejection).toHaveLength(1);
+    listeners.rejection[0]?.(undefined, Promise.resolve());
+    listeners.rejection[0]?.(new Error("bolt frame"), Promise.resolve());
+    expect(errors).toEqual([
+      { event: "daemon.unhandled_rejection", fields: { message: "undefined" } },
+      { event: "daemon.unhandled_rejection", fields: { message: "bolt frame" } },
+    ]);
+  });
+
+  it("exits non-zero on an uncaught exception so KeepAlive restarts", () => {
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const errors: { event: string; fields: Record<string, unknown> }[] = [];
+    installProcessGuards({
+      error(event, fields = {}) {
+        errors.push({ event, fields });
+      },
+    });
+    expect(listeners.exception).toHaveLength(1);
+    listeners.exception[0]?.(new Error("sync boom"), "uncaughtException");
+    expect(errors).toEqual([
+      {
+        event: "daemon.uncaught_exception",
+        fields: { message: "sync boom", name: "Error" },
+      },
+    ]);
+    expect(exit).toHaveBeenCalledWith(1);
   });
 });

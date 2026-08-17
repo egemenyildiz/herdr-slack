@@ -272,6 +272,18 @@ export class HerdBridge {
 
   async #tick(): Promise<void> {
     if (this.#stopped) return;
+    try {
+      await this.#tickBody();
+    } catch (error) {
+      // A wiped shared directory, a locked mount, anything mid-tick — log and
+      // try again next interval. Letting this escape kills the daemon via
+      // unhandledRejection, and KeepAlive only helps after that if the exit
+      // was non-zero; better never to die for a heartbeat in the first place.
+      this.deps.log(`herd tick failed: ${(error as Error).message}`);
+    }
+  }
+
+  async #tickBody(): Promise<void> {
     this.#syncPeers();
     const appId = this.deps.config.slack.appId;
     if (this.#role === "primary") {
