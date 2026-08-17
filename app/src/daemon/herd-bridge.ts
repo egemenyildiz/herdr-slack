@@ -15,6 +15,7 @@ import type { SessionRegistry } from "../registry/registry.js";
 import type { HomeAgent, HomeHerd } from "../slack/home.js";
 import { agentFromPane } from "../slack/home.js";
 import type { SessionController } from "../slack/session-controller.js";
+import { PeerDirectory, hashId, pointerFor, resolveRegistryDir, splitWith } from "./herd-peers.js";
 import {
   HEARTBEAT_INTERVAL_MS,
   type HerdAgentSnapshot,
@@ -56,8 +57,16 @@ export interface HerdBridgeDeps {
    * it is only pretending to hold.
    */
   dryRun?: boolean;
+  /**
+   * Called when a peer on this Slack app is using a different registry. That is
+   * two primaries, which is exactly what makes Home flap. Restarting re-runs
+   * discovery, which lands this daemon on the shared registry and back to one
+   * owner — the alternative is rebuilding the transport in place mid-flight.
+   */
+  onRegistrySplit?: () => void;
   /** Override for tests. */
   registryDir?: string;
+  peersDir?: string;
   herdId?: string;
 }
 
@@ -70,17 +79,39 @@ export class HerdBridge {
   #stopped = false;
   #sessions: SessionController | null = null;
   #promotionAnnounced = false;
+  #splitAnnounced = false;
   /** Cached worktrees, refreshed on the heartbeat tick for peers' launch form. */
   #worktrees: HerdLaunchOptions["worktrees"] = [];
+  readonly #peers: PeerDirectory | null;
+  readonly #appIdHash: string;
 
   constructor(private readonly deps: HerdBridgeDeps) {
     this.herdId = deps.herdId ?? deriveHerdId(deps.instance);
-    const dir =
-      deps.registryDir ?? deps.config.herdRegistryDir ?? defaultHerdRegistryDir(configDir());
-    this.registry = new HerdRegistry(dir, registryKey(deps.config.slack.botToken), {
-      // An explicitly configured directory is the cross-account case, so peers
-      // running as other users have to be able to write into it.
-      shared: deps.config.herdRegistryDir !== undefined,
+    const key = registryKey(deps.config.slack.botToken);
+    this.#appIdHash = hashId(deps.config.slack.appId);
+
+    // A dry run must not advertise itself machine-wide: a phantom pointer would
+    // read as a peer to the real daemons and send them into a restart.
+    this.#peers =
+      deps.dryRun === true || deps.registryDir !== undefined
+        ? null
+        : new PeerDirectory(key, deps.peersDir);
+
+    const choice = this.#chooseRegistry();
+    this.registry = new HerdRegistry(choice.dir, key, { shared: choice.shared });
+    this.deps.log(`herd registry ${choice.dir} (${choice.reason}, shared=${choice.shared})`);
+  }
+
+  #chooseRegistry(): ReturnType<typeof resolveRegistryDir> {
+    const { deps } = this;
+    if (deps.registryDir !== undefined) {
+      return { dir: deps.registryDir, shared: false, reason: "configured" };
+    }
+    return resolveRegistryDir({
+      configured: deps.config.herdRegistryDir,
+      privateDefault: defaultHerdRegistryDir(configDir()),
+      peers: this.#peers?.peers(this.#appIdHash, this.herdId) ?? [],
+      self: this.#peers?.self(this.#appIdHash, this.herdId) ?? null,
     });
   }
 
@@ -125,6 +156,40 @@ export class HerdBridge {
     if (this.#commandTimer) clearInterval(this.#commandTimer);
     this.#commandTimer = null;
     this.registry.removeHeartbeat(this.herdId);
+    this.#peers?.remove(this.herdId);
+  }
+
+  /**
+   * Announce our registry, and notice anyone who is not on it.
+   *
+   * A peer on a different registry cannot see our ownership claim, so it has
+   * elected itself primary too — two Socket Mode clients and two Home
+   * publishers. Discovery on the next boot puts us both on the shared
+   * registry, so the way out is a restart.
+   */
+  #syncPeers(): void {
+    const peers = this.#peers;
+    if (!peers || this.#stopped) return;
+    peers.publish(
+      pointerFor({
+        herdId: this.herdId,
+        appId: this.deps.config.slack.appId,
+        registryDir: this.registry.root,
+      }),
+    );
+
+    const split = splitWith(peers.peers(this.#appIdHash, this.herdId), this.registry.root);
+    if (split.length === 0) {
+      this.#splitAnnounced = false;
+      return;
+    }
+    if (this.#splitAnnounced) return;
+    this.#splitAnnounced = true;
+    const strays = split.map((peer) => peer.herdId).join(", ");
+    this.deps.log(
+      `another herd on this Slack app is using a different registry (${strays}) — both sides think they own Slack, which is what makes Home flap. Restarting to move onto the shared registry.`,
+    );
+    this.deps.onRegistrySplit?.();
   }
 
   /** Snapshot for Home: every live herd on this Slack app. */
@@ -207,6 +272,7 @@ export class HerdBridge {
 
   async #tick(): Promise<void> {
     if (this.#stopped) return;
+    this.#syncPeers();
     const appId = this.deps.config.slack.appId;
     if (this.#role === "primary") {
       this.registry.renewOwnership(appId, this.herdId, process.pid);

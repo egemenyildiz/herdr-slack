@@ -9,7 +9,7 @@ import {
   validateInstance,
   withCredentials,
 } from "../config/config.js";
-import { configDir, stateDir } from "../config/instance.js";
+import { stateDir } from "../config/instance.js";
 import { detectSecretStore } from "../config/secrets.js";
 import { HerdrClient, defaultSocketPath, sessionSocketPath } from "../herdr/client.js";
 import { EventTail } from "../herdr/events.js";
@@ -22,7 +22,6 @@ import type { SlackTransport } from "../slack/transport.js";
 import { WebApiTransport } from "../slack/web-api-transport.js";
 import { RateBudget } from "./budget.js";
 import { HerdBridge } from "./herd-bridge.js";
-import { defaultHerdRegistryDir } from "./herd-registry.js";
 import { Logger } from "./logger.js";
 import { acquireLock, onShutdown, writeRecord } from "./supervisor.js";
 
@@ -132,12 +131,10 @@ any problems below are what a real start would refuse on — this run continues 
 
   // Elect Slack ownership before opening Socket Mode — two Socket Mode clients
   // on the same app race for events and overwrite App Home.
-  // A dry run must touch nothing the real install shares (ADR 0007), so it gets
-  // an isolated registry under the scratch dir even when a real one is
-  // configured — otherwise it would advertise a phantom herd to live daemons.
-  const herdRegistryDir = scratch
-    ? path.join(scratch, "herd-registry")
-    : (config.herdRegistryDir ?? defaultHerdRegistryDir(configDir()));
+  // Which registry is the bridge's call: it discovers whether another OS user
+  // on this machine is already running a herd for this Slack app. A dry run
+  // must touch nothing the real install shares (ADR 0007), so it is pinned to
+  // the scratch dir and takes no part in discovery.
   const herd = new HerdBridge({
     config,
     instance,
@@ -145,15 +142,23 @@ any problems below are what a real start would refuse on — this run continues 
     tail,
     registry,
     client,
+    dryRun,
     log: (line) => log.event("surface", { msg: line }),
-    registryDir: herdRegistryDir,
+    ...(scratch ? { registryDir: path.join(scratch, "herd-registry") } : {}),
     // Ownership is only taken during election, so becoming primary means
     // starting over. Exiting non-zero is what makes the service manager do it.
     onPromotable: () => {
       log.event("daemon.restart_for_ownership", { herdId: herd.herdId });
       process.exit(1);
     },
+    // Same reason: discovery runs at boot, so converging on the shared registry
+    // means booting again.
+    onRegistrySplit: () => {
+      log.error("daemon.registry_split", { herdId: herd.herdId, registryDir: herd.registry.root });
+      process.exit(1);
+    },
   });
+  const herdRegistryDir = herd.registry.root;
   // Always elect: in a dry run the scratch registry has no other herd, so this
   // returns primary — but skipping it left the bridge thinking it was a
   // satellite with no owner, which now (correctly) tries to restart for

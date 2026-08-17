@@ -91,6 +91,29 @@ node app/dist/cli.js daemon stop
 
 That leaves the service installed, so it can come back on login or reboot until you reset.
 
+### More than one herdr instance
+
+One Slack app can front several herdr instances — a personal and a work one, under the same OS user,
+under different accounts on the same Mac, or on another host. Run `setup` for each; there is nothing
+extra to configure.
+
+Exactly one daemon may own the Slack connection. Two would race for interactions and overwrite each
+other's Home tab, which looks like Home flickering between two sets of agents. To avoid it, daemons
+find each other through a small directory every account can reach (`/Users/Shared/herdr-slack` on
+macOS) and elect one owner; the others report in as satellites and show up in the same Home tab. A
+daemon that starts alone keeps its state in its own config directory, where no other account can read
+it, and moves to the shared one only once a second herd appears — which costs it one automatic
+restart, logged as `daemon.registry_split`.
+
+If a herd is on a different host, point every daemon at one directory on a shared mount instead, by
+setting `herdRegistryDir` in `config.json`:
+
+```json
+{ "instances": { "default": { "herdRegistryDir": "/Volumes/team/herdr-slack/registry" } } }
+```
+
+Note that `reset` clears the whole instance section, so re-apply that key after a reset.
+
 ## Usage
 
 Everything is driven from the app's UI — there are no slash commands.

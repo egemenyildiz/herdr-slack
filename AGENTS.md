@@ -69,10 +69,21 @@ Security-sensitive; breaking these is a security bug.
   and only write heartbeats into the shared `herdRegistryDir`. Two Socket Mode clients on one app
   race for interactions, and two Home publishers overwrite each other — so ownership is a file
   lock, not a convention.
-- **Cross-account setups must set `herdRegistryDir` to one shared path on every daemon.** The default
-  is under each user's own config dir, so leaving it unset gives each daemon a *private* registry in
-  which it is trivially the only herd — both elect themselves primary and Home flaps between them.
-  Setting the key also switches the registry to shared file modes; the default stays 0700/0600.
+- **Daemons discover each other; the registry path is not something a user has to get right.** Each
+  one publishes a signed pointer to `<machine shared root>/peers` (`/Users/Shared/herdr-slack` on
+  macOS, `/var/tmp/herdr-slack` elsewhere). A pointer from another herd on the same app means a
+  shared registry is needed, and the daemon moves to `sharedRegistryDir()` and *stays* there — a
+  sleeping peer must not send it back to a private directory only to split again on waking. Alone on
+  a machine it keeps the private 0700 registry, so agent titles and cwds stay unreadable by other
+  local accounts. `herdRegistryDir` still overrides everything, for registries on a network mount.
+- **A pointer never says where to migrate to.** It answers "is anyone else here?" and nothing more;
+  the destination is a constant. Pointers are signed like registry records and carry hashes rather
+  than the app id and path, because that directory is writable and readable by every local account.
+  This is why `herdRegistryDir` was a footgun worth removing: `setup` never wrote it, `reset` deleted
+  it with the rest of the instance section, and each reinstall silently re-split the herds.
+- **A live split warns and restarts, it does not fail closed.** Discovery runs at boot, so a daemon
+  that spots a peer on a different registry logs `daemon.registry_split` and exits non-zero for the
+  service manager. Refusing to run would leave Slack with no owner at all.
 - **Ownership is only taken during election.** A satellite that claimed it mid-flight would demote
   the real primary on its next tick and leave Slack with no owner at all, so a satellite that sees no
   live owner exits non-zero and lets the service manager restart it into an election.
