@@ -112,6 +112,11 @@ export type ActionHandler = (input: {
   viewId?: string;
   /** Present when the action is a select menu, which has no `value`. */
   selectedOption?: string;
+  /**
+   * What is currently typed into the modal. Re-rendering a view replaces its
+   * blocks, so anything already entered is lost unless it is read back here.
+   */
+  viewState?: unknown;
 }) => Promise<void>;
 
 export type MessageHandler = (input: { ctx: InboundContext; text: string }) => Promise<void>;
@@ -218,6 +223,8 @@ export interface ParsedActionPayload {
   viewId?: string;
   /** A select menu reports its choice here rather than in `value`. */
   selectedOption?: string;
+  /** The modal's current field values, for carrying them across a re-render. */
+  viewState?: unknown;
 }
 
 /**
@@ -234,7 +241,8 @@ export function parseActionPayload(body: unknown, action: unknown): ParsedAction
 
   const payload = asRecord(body) ?? {};
   const actionRecord = asRecord(action) ?? {};
-  const viewId = str(asRecord(payload.view)?.id);
+  const view = asRecord(payload.view);
+  const viewId = str(view?.id);
   const selectedOption = str(asRecord(actionRecord.selected_option)?.value);
   return {
     actionId: str(actionRecord.action_id),
@@ -242,5 +250,6 @@ export function parseActionPayload(body: unknown, action: unknown): ParsedAction
     ...(selectedOption ? { selectedOption } : {}),
     triggerId: str(payload.trigger_id),
     ...(viewId ? { viewId } : {}),
+    ...(view?.state ? { viewState: view.state } : {}),
   };
 }

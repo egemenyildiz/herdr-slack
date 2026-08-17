@@ -6,10 +6,12 @@ import {
   BLOCK_IDS,
   MODAL_IDS,
   OPTION_CAP,
+  buildHerdChooserModal,
   buildHistoryModal,
   buildNewAgentModal,
   buildReplyModal,
   capOptions,
+  carriedText,
   parseNewAgentSubmission,
   parseReplySubmission,
   skeletonModal,
@@ -252,12 +254,119 @@ describe("buildNewAgentModal", () => {
     expect(json(view)).toContain("work (3 agents)");
   });
 
+  /**
+   * Slack rejects a view containing a select with no options as
+   * `invalid_blocks`. The update then fails and the modal is left showing the
+   * skeleton's "Loading…" with no way out but closing it — which is what a
+   * peer herd that has not reported its workspaces yet used to produce.
+   */
+  describe("a herd that has reported nothing yet", () => {
+    it("omits the workspace picker rather than emitting an empty one", () => {
+      const view = buildNewAgentModal(model({ workspaces: [] }));
+      const ids = (view.blocks as { block_id: string }[]).map((b) => b.block_id);
+      expect(ids).not.toContain(BLOCK_IDS.workspace);
+      // A path can still be typed, so the form is not useless.
+      expect(ids).toContain(BLOCK_IDS.directoryOther);
+    });
+
+    it("says so instead of rendering a form with no agent to start", () => {
+      const view = buildNewAgentModal(model({ kinds: [] }));
+      const ids = (view.blocks as { block_id: string }[]).map((b) => b.block_id);
+      expect(ids).not.toContain(BLOCK_IDS.kind);
+      expect(json(view)).toContain("has not reported any agent kinds");
+      // Nothing to submit, so no button promising otherwise.
+      expect(view.submit).toBeUndefined();
+    });
+
+    it("emits no select at all with an empty options list", () => {
+      const view = buildNewAgentModal(model({ workspaces: [], worktrees: [] }));
+      for (const block of view.blocks as { element?: { options?: unknown[] } }[]) {
+        if (block.element?.options) expect(block.element.options.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  it("asks the herd picker to report changes, so the form can follow", () => {
+    // An input block is silent by default; without this the workspaces below
+    // stay on whichever herd was rendered first.
+    const view = buildNewAgentModal(
+      model({
+        herds: [
+          { herdId: "h1", label: "work", agentCount: 3, reachable: true },
+          { herdId: "h2", label: "personal", agentCount: 1, reachable: true },
+        ],
+      }),
+    );
+    const herd = (view.blocks as { block_id: string; dispatch_action?: boolean }[]).find(
+      (b) => b.block_id === BLOCK_IDS.herd,
+    );
+    expect(herd?.dispatch_action).toBe(true);
+  });
+
+  it("puts back what was typed before the form was rebuilt", () => {
+    const rendered = json(
+      buildNewAgentModal(
+        model({ defaults: { label: "the refactor", firstPrompt: "start on it" } }),
+      ),
+    );
+    expect(rendered).toContain("the refactor");
+    expect(rendered).toContain("start on it");
+  });
+
   it("omits the herd picker when there is only one place to launch", () => {
     const view = buildNewAgentModal(
       model({ herds: [{ herdId: "h1", label: "work", agentCount: 3, reachable: true }] }),
     );
     const ids = (view.blocks as { block_id: string }[]).map((b) => b.block_id);
     expect(ids).not.toContain(BLOCK_IDS.herd);
+  });
+
+  describe("buildHerdChooserModal", () => {
+    const herds = [
+      { herdId: "h1", label: "work", agentCount: 3, reachable: true },
+      { herdId: "h2", label: "asleep", agentCount: 0, reachable: false },
+    ];
+
+    it("lists every herd with what it is running", () => {
+      const rendered = json(buildHerdChooserModal(herds));
+      expect(rendered).toContain("work");
+      expect(rendered).toContain("3 agents");
+    });
+
+    it("offers no button for a herd that cannot start anything", () => {
+      // Choosing it would only produce a form that fails on submit.
+      const buttons = (
+        buildHerdChooserModal(herds).blocks as { accessory?: { value?: string } }[]
+      ).flatMap((b) => (b.accessory ? [b.accessory.value] : []));
+      expect(buttons).toEqual(["h1"]);
+    });
+
+    it("has nothing to submit — the choice is the step", () => {
+      expect(buildHerdChooserModal(herds).submit).toBeUndefined();
+    });
+  });
+
+  describe("carriedText", () => {
+    const state = {
+      values: {
+        b_label: { a_label: { value: "  the refactor  " } },
+        b_prompt: { a_prompt: { value: "start on it" } },
+        b_workspace: { a_workspace: { selected_option: { value: "w1" } } },
+      },
+    };
+
+    it("keeps the fields that mean the same thing on any machine", () => {
+      expect(carriedText(state)).toEqual({ label: "the refactor", firstPrompt: "start on it" });
+    });
+
+    it("drops a workspace, which belongs to the herd being left behind", () => {
+      expect(carriedText(state)).not.toHaveProperty("workspaceId");
+    });
+
+    it("survives a view with nothing in it", () => {
+      expect(carriedText(undefined)).toEqual({});
+      expect(carriedText({ values: {} })).toEqual({});
+    });
   });
 
   it("marks an unreachable herd rather than hiding it", () => {

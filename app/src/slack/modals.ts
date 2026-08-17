@@ -25,6 +25,8 @@ export const BLOCK_IDS = {
 
 export const ACTION_IDS = {
   herd: "a_herd",
+  /** The button on the "which herd?" step, which carries the id in `value`. */
+  herdStep: "a_herd_step",
   workspace: "a_workspace",
   directory: "a_directory",
   directoryOther: "a_directory_other",
@@ -40,6 +42,15 @@ export const MODAL_INPUT_ACTION_IDS: readonly string[] = Object.values(ACTION_ID
 
 /** Slack refuses a static_select with more than 100 options. */
 export const OPTION_CAP = 100;
+
+/**
+ * Slack also refuses one with *no* options, rejecting the whole view as
+ * `invalid_blocks`. That is not hypothetical here: a peer herd advertises its
+ * workspaces and agent kinds through its heartbeat, and a herd that has not
+ * reported any yet would otherwise render an empty select — the view then fails
+ * to update and the modal sits on "Loading…" until it is closed.
+ */
+const hasOptions = (options: Option[]): boolean => options.length > 0;
 
 const text = (value: string, max = 75): { type: "plain_text"; text: string; emoji: true } => ({
   type: "plain_text",
@@ -73,7 +84,17 @@ function selectBlock(
   actionId: string,
   label: string,
   options: Option[],
-  opts: { optional?: boolean; initial?: string | undefined; placeholder?: string } = {},
+  opts: {
+    optional?: boolean;
+    initial?: string | undefined;
+    placeholder?: string;
+    /**
+     * Report the choice as it is made. An input block is silent by default, so
+     * without this a picker that other fields depend on never tells us to
+     * re-render and the form keeps showing the previous herd's options.
+     */
+    dispatch?: boolean;
+  } = {},
 ): Block {
   const capped = capOptions(options);
   const initial = capped.find((o) => o.value === opts.initial);
@@ -81,6 +102,7 @@ function selectBlock(
     type: "input",
     block_id: blockId,
     ...(opts.optional ? { optional: true } : {}),
+    ...(opts.dispatch ? { dispatch_action: true } : {}),
     label: text(label),
     element: {
       type: "static_select",
@@ -96,7 +118,12 @@ function inputBlock(
   blockId: string,
   actionId: string,
   label: string,
-  opts: { optional?: boolean; multiline?: boolean; placeholder?: string } = {},
+  opts: {
+    optional?: boolean;
+    multiline?: boolean;
+    placeholder?: string;
+    initial?: string | undefined;
+  } = {},
 ): Block {
   return {
     type: "input",
@@ -108,6 +135,7 @@ function inputBlock(
       action_id: actionId,
       ...(opts.multiline ? { multiline: true } : {}),
       ...(opts.placeholder ? { placeholder: text(opts.placeholder, 150) } : {}),
+      ...(opts.initial ? { initial_value: opts.initial } : {}),
     },
   };
 }
@@ -124,6 +152,13 @@ export interface NewAgentDefaults {
   cwd?: string | undefined;
   typedCwd?: string | undefined;
   kind?: string | undefined;
+  /**
+   * Carried across a re-render rather than remembered between launches.
+   * Changing the herd rebuilds the form, and losing a prompt someone had
+   * already typed is a bad trade for a picker sitting above it.
+   */
+  label?: string | undefined;
+  firstPrompt?: string | undefined;
 }
 
 /** A herd the form can launch into. */
@@ -191,6 +226,7 @@ export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown
 
   // Which machine comes first: everything below it (workspaces, worktrees,
   // agent kinds) is that herd's, so choosing it later would mean re-picking.
+  // `dispatch` is what makes the rest of the form follow the choice.
   if (herds.length > 1) {
     blocks.push(
       selectBlock(
@@ -203,26 +239,30 @@ export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown
             : `${herd.label} — unreachable`,
           value: herd.herdId,
         })),
-        { ...(model.selectedHerdId ? { initial: model.selectedHerdId } : {}) },
+        { dispatch: true, ...(model.selectedHerdId ? { initial: model.selectedHerdId } : {}) },
       ),
     );
   }
 
-  blocks.push(
-    selectBlock(
-      BLOCK_IDS.workspace,
-      ACTION_IDS.workspace,
-      "Workspace",
-      model.workspaces.map((w) => ({ label: w.label || w.id, value: w.id })),
-      {
+  // Nothing to launch into means the form cannot work. Say so rather than
+  // rendering a dead one — and rather than an empty select Slack would reject.
+  if (kinds.length === 0) {
+    blocks.push(note("This herd has not reported any agent kinds yet. Try again in a moment."));
+    return { ...shell(model), blocks };
+  }
+
+  const workspaces = model.workspaces.map((w) => ({ label: w.label || w.id, value: w.id }));
+  if (hasOptions(workspaces)) {
+    blocks.push(
+      selectBlock(BLOCK_IDS.workspace, ACTION_IDS.workspace, "Workspace", workspaces, {
         optional: true,
         placeholder: "New workspace",
         ...(model.defaults?.workspaceId ? { initial: model.defaults.workspaceId } : {}),
-      },
-    ),
-  );
+      }),
+    );
+  }
 
-  if (directories.length > 0) {
+  if (hasOptions(directories)) {
     blocks.push(
       selectBlock(BLOCK_IDS.directory, ACTION_IDS.directory, "Directory", directories, {
         optional: true,
@@ -244,23 +284,84 @@ export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown
     inputBlock(BLOCK_IDS.label, ACTION_IDS.label, "Tab label", {
       optional: true,
       placeholder: "what this agent is for",
+      ...(model.defaults?.label ? { initial: model.defaults.label } : {}),
     }),
     inputBlock(BLOCK_IDS.prompt, ACTION_IDS.prompt, "First prompt", {
       optional: true,
       multiline: true,
       placeholder: "What should it start on?",
+      ...(model.defaults?.firstPrompt ? { initial: model.defaults.firstPrompt } : {}),
     }),
   );
 
+  return { ...shell(model), submit: text("Start"), blocks };
+}
+
+const note = (message: string): Block => ({
+  type: "section",
+  text: { type: "mrkdwn", text: message },
+});
+
+function shell(model: NewAgentModel): Block {
   return {
     type: "modal",
     callback_id: MODAL_IDS.newAgent,
     // Carries the target herd even when there is no picker to read it back from.
     private_metadata: model.selectedHerdId ?? "",
     title: text("New agent"),
-    submit: text("Start"),
     close: text("Cancel"),
-    blocks,
+  };
+}
+
+/**
+ * Step one when nothing implies a herd.
+ *
+ * Workspaces, worktrees and agent kinds all belong to a herd, so asking for it
+ * up front is the difference between a form and a guess. Opening straight into
+ * the full form is better whenever the herd *is* implied — the Home tab is
+ * usually already showing one — so this step is skipped in that case.
+ */
+export function buildHerdChooserModal(herds: NewAgentHerd[]): Record<string, unknown> {
+  return {
+    type: "modal",
+    callback_id: MODAL_IDS.newAgent,
+    title: text("New agent"),
+    close: text("Cancel"),
+    blocks: [
+      note("*Which herd should run it?*"),
+      ...herds.map((herd) => ({
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: herd.reachable
+            ? `*${escapeMrkdwn(herd.label)}*\n${herd.agentCount} agent${herd.agentCount === 1 ? "" : "s"}`
+            : `*${escapeMrkdwn(herd.label)}*\nunreachable — wake the machine and start herdr`,
+        },
+        // No button for a herd that cannot start anything: offering one would
+        // only produce a form that fails on submit.
+        ...(herd.reachable
+          ? {
+              accessory: {
+                type: "button",
+                action_id: ACTION_IDS.herdStep,
+                value: herd.herdId,
+                text: text("Choose"),
+              },
+            }
+          : {}),
+      })),
+    ],
+  };
+}
+
+/** A modal that only has something to say — used when a form cannot be built. */
+export function messageModal(title: string, message: string): Record<string, unknown> {
+  return {
+    type: "modal",
+    callback_id: MODAL_IDS.newAgent,
+    title: text(title),
+    close: text("Close"),
+    blocks: [note(message)],
   };
 }
 
@@ -395,6 +496,20 @@ export interface NewAgentSubmission {
 type ViewState = {
   values?: Record<string, Record<string, { value?: string; selected_option?: { value?: string } }>>;
 };
+
+/**
+ * What is worth keeping when the form is rebuilt for another herd.
+ *
+ * Only the herd-independent fields. A workspace or a path belongs to the
+ * machine that was selected a moment ago, so carrying those over would put
+ * someone else's directory in front of the user as if we had found it.
+ */
+export function carriedText(viewState: unknown): NewAgentDefaults {
+  const values = (viewState as ViewState)?.values ?? {};
+  const label = values[BLOCK_IDS.label]?.[ACTION_IDS.label]?.value?.trim();
+  const firstPrompt = values[BLOCK_IDS.prompt]?.[ACTION_IDS.prompt]?.value?.trim();
+  return { ...(label ? { label } : {}), ...(firstPrompt ? { firstPrompt } : {}) };
+}
 
 /**
  * Read a submitted view. Returns null when required fields are missing.

@@ -91,6 +91,32 @@ Security-sensitive; breaking these is a security bug.
   agent counts, then one herd's agents. A single herd skips the overview.
 - `Surfaces` depends on **`HerdPort`**, not on `HerdBridge`, so the multi-herd paths are testable
   without a registry directory or a second daemon.
+- **The launch form asks for a herd before anything else, and only when it has to.** Workspaces,
+  worktrees and agent kinds all belong to one herd, so the form cannot be built until that is known.
+  Drilling into a herd on Home answers the question — open the form directly — and the herd step is
+  for the overview, where guessing would silently offer one machine's workspaces as if they were the
+  only ones. Re-rendering carries the label and prompt over; a workspace or path belongs to the herd
+  being left behind.
+- **A tab label is made unique before `tab.create`** (`freeTabLabel`), because herdr accepts
+  duplicates and two tabs called "review" are indistinguishable in Home, in the terminal, and in
+  thread titles. Agent *names* need no such care — herdr refuses a name in use and `launchAgent`
+  walks to the next one. If herdr will not answer `tab.list`, launch with the label as asked: a
+  duplicate is a much smaller problem than a refused launch.
+
+### Slack Block Kit facts that are not obvious
+
+Each of these has cost a bug. Slack reports all of them the same unhelpful way.
+
+- **An `input` block is silent.** No `block_actions` arrives when its value changes unless the block
+  sets `dispatch_action: true`. Any picker other fields depend on needs it, or the form quietly keeps
+  showing the previous selection's options.
+- **A `static_select` with zero options fails the whole view** as `invalid_blocks`, exactly like the
+  100-option cap. Build option lists through `hasOptions`/`capOptions` and drop the block when it is
+  empty — a peer herd that has not reported its workspaces yet is a normal state, not an error.
+- **A failed `views.update` is invisible**: the skeleton keeps saying "Loading…" and the only way out
+  is closing the modal. Go through `#updateModal`, which retries once and then says what happened.
+- `views.update` replaces blocks wholesale, so anything already typed is gone unless it is read back
+  out of `view.state.values` and passed in as an initial value.
 
 ## Layout
 

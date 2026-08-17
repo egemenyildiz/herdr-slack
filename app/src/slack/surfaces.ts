@@ -33,11 +33,16 @@ import {
   BLOCK_IDS,
   MODAL_IDS,
   MODAL_INPUT_ACTION_IDS,
+  type NewAgentDefaults,
+  type NewAgentHerd,
   type NewAgentSubmission,
   type NewAgentTargets,
+  buildHerdChooserModal,
   buildHistoryModal,
   buildNewAgentModal,
   buildReplyModal,
+  carriedText,
+  messageModal,
   parseNewAgentSubmission,
   parseReplySubmission,
   skeletonModal,
@@ -46,6 +51,9 @@ import { SessionController } from "./session-controller.js";
 import { SESSION_ACTIONS } from "./session.js";
 import type { InboundContext, SlackTransport, ViewSubmitResult } from "./transport.js";
 import { inboundMessageDedupeKey } from "./transport.js";
+
+const describe = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
 
 /** Keep the reply modal open, with the reason under the text box. */
 const replyError = (message: string): ViewSubmitResult => ({
@@ -139,10 +147,12 @@ export class Surfaces {
       await this.publishHome(ctx.userId);
     });
 
-    transport.onAction(async ({ ctx, actionId, value, triggerId, viewId, selectedOption }) => {
-      this.#lastActor = ctx.userId;
-      await this.#onAction(ctx, actionId, value, triggerId, viewId, selectedOption);
-    });
+    transport.onAction(
+      async ({ ctx, actionId, value, triggerId, viewId, selectedOption, viewState }) => {
+        this.#lastActor = ctx.userId;
+        await this.#onAction(ctx, actionId, value, triggerId, viewId, selectedOption, viewState);
+      },
+    );
 
     // Bare DMs have no thread target; treat them as commands, not prompts.
     transport.onMessage(async ({ ctx, text }) => {
@@ -400,13 +410,37 @@ export class Surfaces {
     return;
   }
 
-  /** Open the launch modal; skeleton first because trigger_id expires quickly. */
+  /**
+   * Open the launch modal, asking which herd first when nothing implies one.
+   *
+   * Drilling into a herd on Home is a statement of intent — the agent belongs
+   * where the user was already looking — so that case goes straight to the
+   * form. From the overview with several herds there is nothing to infer, and
+   * guessing would mean silently offering one machine's workspaces.
+   */
   async #openNewAgentModal(triggerId: string, userId: string): Promise<void> {
-    const viewId = await this.deps.transport.openModal(triggerId, skeletonModal("New agent"));
+    const herds = this.#herdOptions();
     const selection = this.#homeSelection.get(userId);
-    const preferred =
-      selection && selection !== ALL_HERDS ? selection : (this.deps.herd?.herdId ?? "");
-    await this.#renderNewAgentModal(viewId, preferred);
+    const drilled = selection && selection !== ALL_HERDS ? selection : undefined;
+    const implied = drilled ?? (herds.length > 1 ? undefined : (this.deps.herd?.herdId ?? ""));
+
+    if (implied === undefined) {
+      await this.deps.transport.openModal(triggerId, buildHerdChooserModal(herds));
+      return;
+    }
+    // Skeleton first: trigger_id expires in about three seconds, well inside
+    // the time herdr can take to answer.
+    const viewId = await this.deps.transport.openModal(triggerId, skeletonModal("New agent"));
+    await this.#renderNewAgentModal(viewId, implied);
+  }
+
+  #herdOptions(): NewAgentHerd[] {
+    return (this.deps.herd?.homeHerds() ?? []).map((row) => ({
+      herdId: row.herdId,
+      label: row.label,
+      agentCount: row.agentCount,
+      reachable: row.herdrStatus === "connected",
+    }));
   }
 
   /**
@@ -415,31 +449,56 @@ export class Surfaces {
    * Re-rendered when the herd changes because everything below that choice
    * (workspaces, worktrees, agent kinds) belongs to the herd, not to us.
    */
-  async #renderNewAgentModal(viewId: string, herdId: string): Promise<void> {
+  async #renderNewAgentModal(
+    viewId: string,
+    herdId: string,
+    carried: NewAgentDefaults = {},
+  ): Promise<void> {
     const { herd } = this.deps;
-    const herds = (herd?.homeHerds() ?? []).map((row) => ({
-      herdId: row.herdId,
-      label: row.label,
-      agentCount: row.agentCount,
-      reachable: row.herdrStatus === "connected",
-    }));
+    const herds = this.#herdOptions();
     const target = herds.some((row) => row.herdId === herdId)
       ? herdId
       : (herds.find((row) => row.reachable)?.herdId ?? herdId);
     const targets = await this.#launchTargets(target);
-    await this.deps.transport.updateModal(
+    // Last-launch defaults describe a workspace and a directory on *this*
+    // machine, so they only apply when this machine is the target. What the
+    // user typed applies either way.
+    const remembered = target === (herd?.herdId ?? "") ? readLastLaunch(this.deps.instance) : {};
+    await this.#updateModal(
       viewId,
       buildNewAgentModal({
         ...targets,
         herds,
         selectedHerdId: target,
-        // Defaults describe the last launch on *this* herd, so they only make
-        // sense when that is what is selected.
-        ...(target === (herd?.herdId ?? "")
-          ? { defaults: readLastLaunch(this.deps.instance) }
-          : {}),
+        defaults: { ...remembered, ...carried },
       }),
     );
+  }
+
+  /**
+   * Update a modal, and never leave it stuck on the skeleton.
+   *
+   * A failed `views.update` is invisible: the modal keeps showing "Loading…"
+   * with no way forward but closing it. Slack can reject an update for reasons
+   * that pass on a second try, so it is worth one — and when it is not, saying
+   * so beats an empty box.
+   */
+  async #updateModal(viewId: string, view: Record<string, unknown>): Promise<void> {
+    const { transport, log } = this.deps;
+    try {
+      await transport.updateModal(viewId, view);
+      return;
+    } catch (error) {
+      log(`modal update failed, retrying: ${describe(error)}`);
+    }
+    try {
+      await transport.updateModal(viewId, view);
+    } catch (error) {
+      log(`modal update failed: ${describe(error)}`);
+      await transport
+        .updateModal(viewId, messageModal("New agent", "Slack would not load this form."))
+        .catch(() => undefined);
+    }
   }
 
   /** Launch options for a herd: live from herdr locally, heartbeat for a peer. */
@@ -728,13 +787,21 @@ export class Surfaces {
     triggerId: string,
     viewId?: string,
     selectedOption?: string,
+    viewState?: unknown,
   ): Promise<void> {
     const { log } = this.deps;
     // Form inputs fire block_actions too. They carry no ref, so falling through
     // to ref resolution would answer every pick with "I do not recognise that".
     if (MODAL_INPUT_ACTION_IDS.includes(actionId)) {
-      if (actionId === ACTION_IDS.herd && viewId && selectedOption) {
-        await this.#renderNewAgentModal(viewId, selectedOption);
+      // The picker reports a selection; the step button carries one in `value`.
+      const chosenHerd =
+        actionId === ACTION_IDS.herd
+          ? selectedOption
+          : actionId === ACTION_IDS.herdStep
+            ? value
+            : undefined;
+      if (chosenHerd && viewId) {
+        await this.#renderNewAgentModal(viewId, chosenHerd, carriedText(viewState));
       }
       return;
     }

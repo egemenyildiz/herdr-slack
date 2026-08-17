@@ -87,7 +87,14 @@ export class FakeTransport implements SlackTransport {
     return `V${this.modals.length}`;
   }
 
+  /** Make the next N views.update calls fail, as a rejected view does. */
+  failModalUpdates = 0;
+
   async updateModal(viewId: string, view: Record<string, unknown>): Promise<void> {
+    if (this.failModalUpdates > 0) {
+      this.failModalUpdates -= 1;
+      throw new Error("invalid_blocks");
+    }
     this.modalUpdates.push({ viewId, view });
   }
 

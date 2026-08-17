@@ -204,7 +204,7 @@ describe("Surfaces", () => {
       expect(transport.lastHomeText()).toContain("🐑 Herds · 2");
     });
 
-    it("offers the herd picker first in the launch form", async () => {
+    it("asks which herd before offering a form it would have to guess at", async () => {
       await build(config(), FakeHerd.withPeer());
       await transport.emitAction({
         ctx: ctx(),
@@ -212,9 +212,131 @@ describe("Surfaces", () => {
         value: "new",
         triggerId: "t1",
       });
+      const opened = JSON.stringify(transport.modals.at(-1)?.view ?? {});
+      expect(opened).toContain("Which herd");
+      expect(opened).toContain("personal");
+      // No form yet: every field below the herd belongs to a herd.
+      expect(transport.modalUpdates).toEqual([]);
+    });
+
+    it("opens the form on the herd already showing on Home", async () => {
+      // Drilling in is a statement of intent — asking again is a step for
+      // nothing, and defaulting to the local herd would be the wrong guess.
+      await build(config(), FakeHerd.withPeer());
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_select_herd",
+        value: "host:them:default",
+        triggerId: "t1",
+      });
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_new_agent",
+        value: "new",
+        triggerId: "t2",
+      });
       const blocks = (transport.modalUpdates.at(-1)?.view.blocks ?? []) as { block_id: string }[];
       expect(blocks[0]?.block_id).toBe("b_herd");
-      expect(modalJson()).toContain("personal");
+      expect(modalJson()).toContain("their workspace");
+    });
+
+    it("moves from the herd step to that herd's form", async () => {
+      await build(config(), FakeHerd.withPeer());
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_new_agent",
+        value: "new",
+        triggerId: "t1",
+      });
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "a_herd_step",
+        value: "host:them:default",
+        triggerId: "t2",
+        viewId: "V1",
+      });
+      expect(modalJson()).toContain("their workspace");
+    });
+
+    it("lets the herd picker report a change, or the form cannot follow it", async () => {
+      // An input block is silent unless it says otherwise, which left the form
+      // showing the first herd's workspaces whatever was picked.
+      await build(config(), FakeHerd.withPeer());
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_select_herd",
+        value: "host:them:default",
+        triggerId: "t1",
+      });
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_new_agent",
+        value: "new",
+        triggerId: "t2",
+      });
+      const blocks = (transport.modalUpdates.at(-1)?.view.blocks ?? []) as {
+        block_id: string;
+        dispatch_action?: boolean;
+      }[];
+      expect(blocks.find((b) => b.block_id === "b_herd")?.dispatch_action).toBe(true);
+    });
+
+    /**
+     * A failed views.update is invisible in Slack: the modal keeps showing the
+     * skeleton's "Loading…" and the only way out is closing it.
+     */
+    describe("when Slack refuses to update the view", () => {
+      it("tries again, since the same view often lands on a second attempt", async () => {
+        await build(config(), FakeHerd.withPeer());
+        transport.failModalUpdates = 1;
+        await transport.emitAction({
+          ctx: ctx(),
+          actionId: "a_herd_step",
+          value: "host:them:default",
+          triggerId: "t1",
+          viewId: "V1",
+        });
+        expect(modalJson()).toContain("their workspace");
+      });
+
+      it("says so rather than leaving it loading forever", async () => {
+        await build(config(), FakeHerd.withPeer());
+        transport.failModalUpdates = 2;
+        await transport.emitAction({
+          ctx: ctx(),
+          actionId: "a_herd_step",
+          value: "host:them:default",
+          triggerId: "t1",
+          viewId: "V1",
+        });
+        expect(modalJson()).toContain("Slack would not load this form");
+      });
+    });
+
+    it("keeps what was typed when the herd changes under it", async () => {
+      await build(config(), FakeHerd.withPeer());
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "home_new_agent",
+        value: "new",
+        triggerId: "t1",
+      });
+      await transport.emitAction({
+        ctx: ctx(),
+        actionId: "a_herd",
+        value: "",
+        triggerId: "t2",
+        viewId: "V1",
+        selectedOption: "host:them:default",
+        viewState: {
+          values: {
+            b_label: { a_label: { value: "the refactor" } },
+            b_prompt: { a_prompt: { value: "start on the bug" } },
+          },
+        },
+      });
+      expect(modalJson()).toContain("the refactor");
+      expect(modalJson()).toContain("start on the bug");
     });
 
     it("re-renders the form with the chosen herd's workspaces", async () => {

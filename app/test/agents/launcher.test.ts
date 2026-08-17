@@ -386,11 +386,71 @@ describe("launchAgent", () => {
       sleep: noSleep,
     });
 
-    expect(fake.requests[0]?.params).toMatchObject({
+    expect(fake.requests.find((r) => r.method === "tab.create")?.params).toMatchObject({
       workspace_id: "w2",
       cwd: "/work/app",
       label: "fix auth",
       focus: false,
+    });
+  });
+
+  /**
+   * herdr accepts a duplicate label without complaint, and two tabs with the
+   * same name are indistinguishable in Home, in the terminal, and in thread
+   * titles. Unlike agent names, nothing else catches this.
+   */
+  describe("tab labels", () => {
+    const createdLabel = (): unknown =>
+      (fake.requests.find((r) => r.method === "tab.create")?.params as { label?: unknown })?.label;
+
+    const launchWithLabel = async (label: string, existing: string[]): Promise<void> => {
+      tabCreates();
+      fake.on("tab.list", () => ({
+        tabs: existing.map((l, i) => ({ tab_id: `t${i}`, label: l })),
+      }));
+      fake.on("pane.process_info", () => ({ process: { foreground_command: null } }));
+      fake.on("agent.start", () => ({ ok: true }));
+      await launchAgent(client, request({ label }), { sleep: noSleep });
+    };
+
+    it("keeps the asked-for label when nothing else has it", async () => {
+      await launchWithLabel("review", ["build", "deploy"]);
+      expect(createdLabel()).toBe("review");
+    });
+
+    it("numbers a label a live tab is already using", async () => {
+      await launchWithLabel("review", ["review"]);
+      expect(createdLabel()).toBe("review 2");
+    });
+
+    it("keeps counting past the numbered ones", async () => {
+      await launchWithLabel("review", ["review", "review 2", "review 3"]);
+      expect(createdLabel()).toBe("review 4");
+    });
+
+    it("treats a label as taken whatever its case", async () => {
+      await launchWithLabel("Review", ["review"]);
+      expect(createdLabel()).toBe("Review 2");
+    });
+
+    it("launches anyway when herdr will not list tabs", async () => {
+      // A duplicate label is a far smaller problem than refusing to start.
+      // tab.list is deliberately left unanswered.
+      tabCreates();
+      fake.on("pane.process_info", () => ({ process: { foreground_command: null } }));
+      fake.on("agent.start", () => ({ ok: true }));
+
+      const result = await launchAgent(client, request({ label: "review" }), { sleep: noSleep });
+      expect(result.ok).toBe(true);
+      expect(createdLabel()).toBe("review");
+    });
+
+    it("does not ask herdr for tabs when no label was given", async () => {
+      tabCreates();
+      fake.on("pane.process_info", () => ({ process: { foreground_command: null } }));
+      fake.on("agent.start", () => ({ ok: true }));
+      await launchAgent(client, request(), { sleep: noSleep });
+      expect(fake.requests.some((r) => r.method === "tab.list")).toBe(false);
     });
   });
 });

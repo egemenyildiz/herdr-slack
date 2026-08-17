@@ -34,6 +34,8 @@ export interface LaunchResult {
 const NAME_ATTEMPTS = 5;
 /** herdr's cap on an agent name. */
 const NAME_LIMIT = 32;
+/** How many tab labels to try before falling back to something unique. */
+const LABEL_ATTEMPTS = 50;
 
 /** Whether herdr refused because the name is already taken by a live agent. */
 function isNameTaken(error: unknown): boolean {
@@ -45,6 +47,42 @@ function isNameTaken(error: unknown): boolean {
 function suffixed(name: string, n: number): string {
   const tail = `-${n}`;
   return `${name.slice(0, NAME_LIMIT - tail.length)}${tail}`;
+}
+
+/**
+ * A tab label no live tab is already using.
+ *
+ * herdr accepts duplicates happily, and the result is two tabs called "review"
+ * — in the terminal, in Home, and in the thread titles — with nothing to tell
+ * them apart. Agent *names* are deduplicated by herdr refusing them, but labels
+ * have no such backstop, so the check is ours to make.
+ *
+ * Comparison is case-insensitive because "Review" and "review" are the same tab
+ * to anyone reading the list.
+ */
+export async function freeTabLabel(client: HerdrClient, wanted: string): Promise<string> {
+  const label = wanted.trim();
+  if (!label) return label;
+
+  let taken: Set<string>;
+  try {
+    taken = new Set(
+      (await client.tabList())
+        .map((tab) => tab.label?.trim().toLowerCase())
+        .filter((value): value is string => Boolean(value)),
+    );
+  } catch {
+    // herdr did not answer. A duplicate label is a much smaller problem than
+    // refusing to launch over one, so take the name as asked.
+    return label;
+  }
+
+  if (!taken.has(label.toLowerCase())) return label;
+  for (let n = 2; n <= LABEL_ATTEMPTS; n += 1) {
+    const candidate = `${label} ${n}`;
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
+  return `${label} ${Date.now().toString(36).slice(-4)}`;
 }
 
 /** herdr's own constraint on agent names. */
@@ -73,6 +111,8 @@ export async function launchAgent(
     sleep = defaultSleep,
   } = options;
 
+  const label = request.label ? await freeTabLabel(client, request.label) : "";
+
   let paneId: string;
   let tabId: string;
   try {
@@ -82,7 +122,7 @@ export async function launchAgent(
     }>("tab.create", {
       ...(request.workspaceId ? { workspace_id: request.workspaceId } : {}),
       ...(request.cwd ? { cwd: request.cwd } : {}),
-      ...(request.label ? { label: request.label } : {}),
+      ...(label ? { label } : {}),
       focus: false,
     });
     // agent.start needs root_pane from tab.create.
