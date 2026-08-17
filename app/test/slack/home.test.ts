@@ -293,12 +293,19 @@ describe("more than one herd", () => {
     expect(rendered).not.toContain(ALL_HERDS);
   });
 
-  it("keeps New agent while one herd is reachable, even if another is asleep", () => {
+  it("offers no launch from the overview, where no herd is implied", () => {
+    // Workspaces, directories and agent kinds all belong to one machine, so a
+    // launch has to start from one. Which herd is asleep makes no difference.
     const rendered = text(
       buildHome(twoHerds({ herds: [work, { ...personal, herdrStatus: "waiting" }] })),
     );
-    expect(rendered).toContain("home_new_agent");
+    expect(rendered).not.toContain("home_new_agent");
     expect(rendered).toContain("herdr down");
+  });
+
+  it("offers the launch once you are inside a herd", () => {
+    const rendered = text(buildHome(twoHerds({ selectedHerdId: "work" })));
+    expect(rendered).toContain("home_new_agent");
   });
 
   it("drops New agent when the herd you are looking at is asleep", () => {

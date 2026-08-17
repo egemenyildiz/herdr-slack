@@ -12,7 +12,6 @@ export const MODAL_IDS = {
 } as const;
 
 export const BLOCK_IDS = {
-  herd: "b_herd",
   workspace: "b_workspace",
   directory: "b_directory",
   directoryOther: "b_directory_other",
@@ -24,9 +23,6 @@ export const BLOCK_IDS = {
 } as const;
 
 export const ACTION_IDS = {
-  herd: "a_herd",
-  /** The button on the "which herd?" step, which carries the id in `value`. */
-  herdStep: "a_herd_step",
   workspace: "a_workspace",
   directory: "a_directory",
   directoryOther: "a_directory_other",
@@ -84,17 +80,7 @@ function selectBlock(
   actionId: string,
   label: string,
   options: Option[],
-  opts: {
-    optional?: boolean;
-    initial?: string | undefined;
-    placeholder?: string;
-    /**
-     * Report the choice as it is made. An input block is silent by default, so
-     * without this a picker that other fields depend on never tells us to
-     * re-render and the form keeps showing the previous herd's options.
-     */
-    dispatch?: boolean;
-  } = {},
+  opts: { optional?: boolean; initial?: string | undefined; placeholder?: string } = {},
 ): Block {
   const capped = capOptions(options);
   const initial = capped.find((o) => o.value === opts.initial);
@@ -102,7 +88,6 @@ function selectBlock(
     type: "input",
     block_id: blockId,
     ...(opts.optional ? { optional: true } : {}),
-    ...(opts.dispatch ? { dispatch_action: true } : {}),
     label: text(label),
     element: {
       type: "static_select",
@@ -152,21 +137,6 @@ export interface NewAgentDefaults {
   cwd?: string | undefined;
   typedCwd?: string | undefined;
   kind?: string | undefined;
-  /**
-   * Carried across a re-render rather than remembered between launches.
-   * Changing the herd rebuilds the form, and losing a prompt someone had
-   * already typed is a bad trade for a picker sitting above it.
-   */
-  label?: string | undefined;
-  firstPrompt?: string | undefined;
-}
-
-/** A herd the form can launch into. */
-export interface NewAgentHerd {
-  herdId: string;
-  label: string;
-  agentCount: number;
-  reachable: boolean;
 }
 
 /**
@@ -187,23 +157,20 @@ export interface NewAgentModel extends NewAgentTargets {
   favouriteDirs?: string[];
   defaults?: NewAgentDefaults | undefined;
   /**
-   * Herds to choose between. Omitted or single means no picker: there is only
-   * one place the agent could start.
+   * Which herd this launch is for. Not a choice in the form: ＋ New agent only
+   * exists inside a herd's view, so the answer is whichever herd the reader was
+   * already looking at. It rides in `private_metadata` to survive the round
+   * trip to submission.
    */
-  herds?: NewAgentHerd[];
   selectedHerdId?: string | undefined;
 }
 
 /**
- * The New agent modal, opened from the Home tab's ＋ New agent button.
+ * The New agent modal, opened from a herd's view on the Home tab.
  *
  * A skeleton is opened first and this replaces it via views.update, because
  * trigger_id expires in about three seconds and fetching workspaces and
  * worktrees from herdr first would routinely blow that window.
- *
- * Mode options depend on the chosen agent, so the modal is re-rendered on that
- * selection — external_select would need a public HTTPS endpoint, which this
- * project deliberately does not have.
  */
 export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown> {
   const kinds = model.kinds.map((entry) => ({
@@ -221,28 +188,7 @@ export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown
     })),
   ];
 
-  const herds = model.herds ?? [];
   const blocks: Block[] = [];
-
-  // Which machine comes first: everything below it (workspaces, worktrees,
-  // agent kinds) is that herd's, so choosing it later would mean re-picking.
-  // `dispatch` is what makes the rest of the form follow the choice.
-  if (herds.length > 1) {
-    blocks.push(
-      selectBlock(
-        BLOCK_IDS.herd,
-        ACTION_IDS.herd,
-        "Herd",
-        herds.map((herd) => ({
-          label: herd.reachable
-            ? `${herd.label} (${herd.agentCount} agent${herd.agentCount === 1 ? "" : "s"})`
-            : `${herd.label} — unreachable`,
-          value: herd.herdId,
-        })),
-        { dispatch: true, ...(model.selectedHerdId ? { initial: model.selectedHerdId } : {}) },
-      ),
-    );
-  }
 
   // Nothing to launch into means the form cannot work. Say so rather than
   // rendering a dead one — and rather than an empty select Slack would reject.
@@ -284,13 +230,11 @@ export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown
     inputBlock(BLOCK_IDS.label, ACTION_IDS.label, "Tab label", {
       optional: true,
       placeholder: "what this agent is for",
-      ...(model.defaults?.label ? { initial: model.defaults.label } : {}),
     }),
     inputBlock(BLOCK_IDS.prompt, ACTION_IDS.prompt, "First prompt", {
       optional: true,
       multiline: true,
       placeholder: "What should it start on?",
-      ...(model.defaults?.firstPrompt ? { initial: model.defaults.firstPrompt } : {}),
     }),
   );
 
@@ -310,47 +254,6 @@ function shell(model: NewAgentModel): Block {
     private_metadata: model.selectedHerdId ?? "",
     title: text("New agent"),
     close: text("Cancel"),
-  };
-}
-
-/**
- * Step one when nothing implies a herd.
- *
- * Workspaces, worktrees and agent kinds all belong to a herd, so asking for it
- * up front is the difference between a form and a guess. Opening straight into
- * the full form is better whenever the herd *is* implied — the Home tab is
- * usually already showing one — so this step is skipped in that case.
- */
-export function buildHerdChooserModal(herds: NewAgentHerd[]): Record<string, unknown> {
-  return {
-    type: "modal",
-    callback_id: MODAL_IDS.newAgent,
-    title: text("New agent"),
-    close: text("Cancel"),
-    blocks: [
-      note("*Which herd should run it?*"),
-      ...herds.map((herd) => ({
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: herd.reachable
-            ? `*${escapeMrkdwn(herd.label)}*\n${herd.agentCount} agent${herd.agentCount === 1 ? "" : "s"}`
-            : `*${escapeMrkdwn(herd.label)}*\nunreachable — wake the machine and start herdr`,
-        },
-        // No button for a herd that cannot start anything: offering one would
-        // only produce a form that fails on submit.
-        ...(herd.reachable
-          ? {
-              accessory: {
-                type: "button",
-                action_id: ACTION_IDS.herdStep,
-                value: herd.herdId,
-                text: text("Choose"),
-              },
-            }
-          : {}),
-      })),
-    ],
   };
 }
 
@@ -498,24 +401,11 @@ type ViewState = {
 };
 
 /**
- * What is worth keeping when the form is rebuilt for another herd.
- *
- * Only the herd-independent fields. A workspace or a path belongs to the
- * machine that was selected a moment ago, so carrying those over would put
- * someone else's directory in front of the user as if we had found it.
- */
-export function carriedText(viewState: unknown): NewAgentDefaults {
-  const values = (viewState as ViewState)?.values ?? {};
-  const label = values[BLOCK_IDS.label]?.[ACTION_IDS.label]?.value?.trim();
-  const firstPrompt = values[BLOCK_IDS.prompt]?.[ACTION_IDS.prompt]?.value?.trim();
-  return { ...(label ? { label } : {}), ...(firstPrompt ? { firstPrompt } : {}) };
-}
-
-/**
  * Read a submitted view. Returns null when required fields are missing.
  *
- * `privateMetadata` is the fallback target herd, for the single-herd case where
- * the picker is not rendered at all.
+ * `privateMetadata` is the target herd. The form never asks for one — ＋ New
+ * agent only exists inside a herd's view — so this is the only place it is
+ * recorded.
  */
 export function parseNewAgentSubmission(
   view: unknown,
@@ -530,7 +420,7 @@ export function parseNewAgentSubmission(
   const kind = pick(BLOCK_IDS.kind, ACTION_IDS.kind);
   if (!kind) return null;
 
-  const herdId = pick(BLOCK_IDS.herd, ACTION_IDS.herd) ?? privateMetadata.trim();
+  const herdId = privateMetadata.trim();
 
   // A typed path wins over the picker: someone who typed one meant it.
   const typed = pick(BLOCK_IDS.directoryOther, ACTION_IDS.directoryOther)?.trim();

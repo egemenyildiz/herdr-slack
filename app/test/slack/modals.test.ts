@@ -6,12 +6,10 @@ import {
   BLOCK_IDS,
   MODAL_IDS,
   OPTION_CAP,
-  buildHerdChooserModal,
   buildHistoryModal,
   buildNewAgentModal,
   buildReplyModal,
   capOptions,
-  carriedText,
   parseNewAgentSubmission,
   parseReplySubmission,
   skeletonModal,
@@ -235,23 +233,13 @@ describe("buildNewAgentModal", () => {
     expect(json(view)).not.toContain('"text":""');
   });
 
-  it("puts the herd first when there is more than one, and remembers the choice", () => {
-    // Everything below the herd belongs to it, so picking it later would mean
-    // re-picking the workspace and directory.
-    const view = buildNewAgentModal(
-      model({
-        herds: [
-          { herdId: "h1", label: "work", agentCount: 3, reachable: true },
-          { herdId: "h2", label: "personal", agentCount: 1, reachable: true },
-        ],
-        selectedHerdId: "h2",
-      }),
-    );
+  it("carries the target herd without asking which one", () => {
+    // ＋ New agent only exists inside a herd's view, so the herd is already
+    // decided; a picker would be asking a question with one answer.
+    const view = buildNewAgentModal(model({ selectedHerdId: "h2" }));
     const ids = (view.blocks as { block_id: string }[]).map((b) => b.block_id);
-    expect(ids[0]).toBe(BLOCK_IDS.herd);
-    expect(ids.indexOf(BLOCK_IDS.herd)).toBeLessThan(ids.indexOf(BLOCK_IDS.workspace));
+    expect(ids).not.toContain("b_herd");
     expect(view.private_metadata).toBe("h2");
-    expect(json(view)).toContain("work (3 agents)");
   });
 
   /**
@@ -286,99 +274,14 @@ describe("buildNewAgentModal", () => {
     });
   });
 
-  it("asks the herd picker to report changes, so the form can follow", () => {
-    // An input block is silent by default; without this the workspaces below
-    // stay on whichever herd was rendered first.
-    const view = buildNewAgentModal(
-      model({
-        herds: [
-          { herdId: "h1", label: "work", agentCount: 3, reachable: true },
-          { herdId: "h2", label: "personal", agentCount: 1, reachable: true },
-        ],
-      }),
+  it("prefills the directory someone typed last time", () => {
+    // The initial value was being dropped on the floor: `inputBlock` accepted
+    // the option and never rendered it.
+    const view = buildNewAgentModal(model({ defaults: { typedCwd: "/work/app" } }));
+    const block = (view.blocks as { block_id: string; element?: Record<string, unknown> }[]).find(
+      (b) => b.block_id === BLOCK_IDS.directoryOther,
     );
-    const herd = (view.blocks as { block_id: string; dispatch_action?: boolean }[]).find(
-      (b) => b.block_id === BLOCK_IDS.herd,
-    );
-    expect(herd?.dispatch_action).toBe(true);
-  });
-
-  it("puts back what was typed before the form was rebuilt", () => {
-    const rendered = json(
-      buildNewAgentModal(
-        model({ defaults: { label: "the refactor", firstPrompt: "start on it" } }),
-      ),
-    );
-    expect(rendered).toContain("the refactor");
-    expect(rendered).toContain("start on it");
-  });
-
-  it("omits the herd picker when there is only one place to launch", () => {
-    const view = buildNewAgentModal(
-      model({ herds: [{ herdId: "h1", label: "work", agentCount: 3, reachable: true }] }),
-    );
-    const ids = (view.blocks as { block_id: string }[]).map((b) => b.block_id);
-    expect(ids).not.toContain(BLOCK_IDS.herd);
-  });
-
-  describe("buildHerdChooserModal", () => {
-    const herds = [
-      { herdId: "h1", label: "work", agentCount: 3, reachable: true },
-      { herdId: "h2", label: "asleep", agentCount: 0, reachable: false },
-    ];
-
-    it("lists every herd with what it is running", () => {
-      const rendered = json(buildHerdChooserModal(herds));
-      expect(rendered).toContain("work");
-      expect(rendered).toContain("3 agents");
-    });
-
-    it("offers no button for a herd that cannot start anything", () => {
-      // Choosing it would only produce a form that fails on submit.
-      const buttons = (
-        buildHerdChooserModal(herds).blocks as { accessory?: { value?: string } }[]
-      ).flatMap((b) => (b.accessory ? [b.accessory.value] : []));
-      expect(buttons).toEqual(["h1"]);
-    });
-
-    it("has nothing to submit — the choice is the step", () => {
-      expect(buildHerdChooserModal(herds).submit).toBeUndefined();
-    });
-  });
-
-  describe("carriedText", () => {
-    const state = {
-      values: {
-        b_label: { a_label: { value: "  the refactor  " } },
-        b_prompt: { a_prompt: { value: "start on it" } },
-        b_workspace: { a_workspace: { selected_option: { value: "w1" } } },
-      },
-    };
-
-    it("keeps the fields that mean the same thing on any machine", () => {
-      expect(carriedText(state)).toEqual({ label: "the refactor", firstPrompt: "start on it" });
-    });
-
-    it("drops a workspace, which belongs to the herd being left behind", () => {
-      expect(carriedText(state)).not.toHaveProperty("workspaceId");
-    });
-
-    it("survives a view with nothing in it", () => {
-      expect(carriedText(undefined)).toEqual({});
-      expect(carriedText({ values: {} })).toEqual({});
-    });
-  });
-
-  it("marks an unreachable herd rather than hiding it", () => {
-    const view = buildNewAgentModal(
-      model({
-        herds: [
-          { herdId: "h1", label: "work", agentCount: 3, reachable: true },
-          { herdId: "h2", label: "asleep", agentCount: 0, reachable: false },
-        ],
-      }),
-    );
-    expect(json(view)).toContain("asleep — unreachable");
+    expect(block?.element?.initial_value).toBe("/work/app");
   });
 });
 

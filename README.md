@@ -118,8 +118,12 @@ Note that `reset` clears the whole instance section, so re-apply that key after 
 
 Everything is driven from the app's UI — there are no slash commands.
 
-- **Home tab** — the hub: agents grouped by workspace, blocked agents first. **＋ New agent** launches
-  one (workspace, directory, kind, first prompt); **Open** brings up a session card.
+- **Home tab** — the hub: agents grouped by workspace, blocked agents first. **Open** brings up a
+  session card. With more than one herdr instance reporting in, Home opens on a list of them and you
+  pick one first.
+- **＋ New agent** — inside a herd, launches one there (workspace, directory, kind, first prompt).
+  Everything it asks for belongs to that one machine, which is why the button is not on the list of
+  herds.
 - **Session cards** — one updating card per agent: latest Slack prompt, latest response, and the
   agent's state in words (*Working*, *Waiting on you*, *Idle*, *Finished*).
 - **Reply** — opens a modal and starts one tracked remote turn; the card updates automatically when

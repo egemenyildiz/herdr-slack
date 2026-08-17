@@ -204,29 +204,12 @@ describe("Surfaces", () => {
       expect(transport.lastHomeText()).toContain("🐑 Herds · 2");
     });
 
-    it("asks which herd before offering a form it would have to guess at", async () => {
-      await build(config(), FakeHerd.withPeer());
-      await transport.emitAction({
-        ctx: ctx(),
-        actionId: "home_new_agent",
-        value: "new",
-        triggerId: "t1",
-      });
-      const opened = JSON.stringify(transport.modals.at(-1)?.view ?? {});
-      expect(opened).toContain("Which herd");
-      expect(opened).toContain("personal");
-      // No form yet: every field below the herd belongs to a herd.
-      expect(transport.modalUpdates).toEqual([]);
-    });
-
-    it("opens the form on the herd already showing on Home", async () => {
-      // Drilling in is a statement of intent — asking again is a step for
-      // nothing, and defaulting to the local herd would be the wrong guess.
-      await build(config(), FakeHerd.withPeer());
+    /** Drilling in is what names the herd; the form never asks. */
+    const openFormOn = async (herdId: string): Promise<void> => {
       await transport.emitAction({
         ctx: ctx(),
         actionId: "home_select_herd",
-        value: "host:them:default",
+        value: herdId,
         triggerId: "t1",
       });
       await transport.emitAction({
@@ -235,12 +218,28 @@ describe("Surfaces", () => {
         value: "new",
         triggerId: "t2",
       });
-      const blocks = (transport.modalUpdates.at(-1)?.view.blocks ?? []) as { block_id: string }[];
-      expect(blocks[0]?.block_id).toBe("b_herd");
+    };
+
+    it("builds the form from the herd whose view it was opened in", async () => {
+      await build(config(), FakeHerd.withPeer());
+      await openFormOn("host:them:default");
+      // These belong to the peer, and could not have come from our own socket.
       expect(modalJson()).toContain("their workspace");
+      expect(modalJson()).toContain("their-tree");
     });
 
-    it("moves from the herd step to that herd's form", async () => {
+    it("carries that herd to submission without asking for it", async () => {
+      await build(config(), FakeHerd.withPeer());
+      await openFormOn("host:them:default");
+      const view = transport.modalUpdates.at(-1)?.view ?? {};
+      const ids = ((view.blocks ?? []) as { block_id: string }[]).map((b) => b.block_id);
+      expect(ids).not.toContain("b_herd");
+      expect(view.private_metadata).toBe("host:them:default");
+    });
+
+    it("refuses from the overview, where no herd is implied", async () => {
+      // Nothing to infer with several herds in view, and guessing would offer
+      // one machine's workspaces as if they were the only ones.
       await build(config(), FakeHerd.withPeer());
       await transport.emitAction({
         ctx: ctx(),
@@ -248,37 +247,8 @@ describe("Surfaces", () => {
         value: "new",
         triggerId: "t1",
       });
-      await transport.emitAction({
-        ctx: ctx(),
-        actionId: "a_herd_step",
-        value: "host:them:default",
-        triggerId: "t2",
-        viewId: "V1",
-      });
-      expect(modalJson()).toContain("their workspace");
-    });
-
-    it("lets the herd picker report a change, or the form cannot follow it", async () => {
-      // An input block is silent unless it says otherwise, which left the form
-      // showing the first herd's workspaces whatever was picked.
-      await build(config(), FakeHerd.withPeer());
-      await transport.emitAction({
-        ctx: ctx(),
-        actionId: "home_select_herd",
-        value: "host:them:default",
-        triggerId: "t1",
-      });
-      await transport.emitAction({
-        ctx: ctx(),
-        actionId: "home_new_agent",
-        value: "new",
-        triggerId: "t2",
-      });
-      const blocks = (transport.modalUpdates.at(-1)?.view.blocks ?? []) as {
-        block_id: string;
-        dispatch_action?: boolean;
-      }[];
-      expect(blocks.find((b) => b.block_id === "b_herd")?.dispatch_action).toBe(true);
+      expect(transport.modals).toEqual([]);
+      expect(transport.ephemerals.at(-1)?.text).toContain("not reachable");
     });
 
     /**
@@ -289,75 +259,16 @@ describe("Surfaces", () => {
       it("tries again, since the same view often lands on a second attempt", async () => {
         await build(config(), FakeHerd.withPeer());
         transport.failModalUpdates = 1;
-        await transport.emitAction({
-          ctx: ctx(),
-          actionId: "a_herd_step",
-          value: "host:them:default",
-          triggerId: "t1",
-          viewId: "V1",
-        });
+        await openFormOn("host:them:default");
         expect(modalJson()).toContain("their workspace");
       });
 
       it("says so rather than leaving it loading forever", async () => {
         await build(config(), FakeHerd.withPeer());
         transport.failModalUpdates = 2;
-        await transport.emitAction({
-          ctx: ctx(),
-          actionId: "a_herd_step",
-          value: "host:them:default",
-          triggerId: "t1",
-          viewId: "V1",
-        });
+        await openFormOn("host:them:default");
         expect(modalJson()).toContain("Slack would not load this form");
       });
-    });
-
-    it("keeps what was typed when the herd changes under it", async () => {
-      await build(config(), FakeHerd.withPeer());
-      await transport.emitAction({
-        ctx: ctx(),
-        actionId: "home_new_agent",
-        value: "new",
-        triggerId: "t1",
-      });
-      await transport.emitAction({
-        ctx: ctx(),
-        actionId: "a_herd",
-        value: "",
-        triggerId: "t2",
-        viewId: "V1",
-        selectedOption: "host:them:default",
-        viewState: {
-          values: {
-            b_label: { a_label: { value: "the refactor" } },
-            b_prompt: { a_prompt: { value: "start on the bug" } },
-          },
-        },
-      });
-      expect(modalJson()).toContain("the refactor");
-      expect(modalJson()).toContain("start on the bug");
-    });
-
-    it("re-renders the form with the chosen herd's workspaces", async () => {
-      await build(config(), FakeHerd.withPeer());
-      await transport.emitAction({
-        ctx: ctx(),
-        actionId: "home_new_agent",
-        value: "new",
-        triggerId: "t1",
-      });
-      await transport.emitAction({
-        ctx: ctx(),
-        actionId: "a_herd",
-        value: "",
-        triggerId: "t2",
-        viewId: "V1",
-        selectedOption: "host:them:default",
-      });
-      // Those belong to the peer, and could not have come from our own socket.
-      expect(modalJson()).toContain("their workspace");
-      expect(modalJson()).toContain("their-tree");
     });
 
     it("does not answer a form input as if it were a session button", async () => {
@@ -381,9 +292,9 @@ describe("Surfaces", () => {
       await transport.emitViewSubmit({
         ctx: ctx(),
         callbackId: "modal_new_agent",
+        privateMetadata: "host:them:default",
         view: {
           values: {
-            b_herd: { a_herd: { selected_option: { value: "host:them:default" } } },
             b_kind: { a_kind: { selected_option: { value: "claude" } } },
             b_prompt: { a_prompt: { value: "start on the bug" } },
           },
@@ -402,29 +313,19 @@ describe("Surfaces", () => {
       await transport.emitViewSubmit({
         ctx: ctx(),
         callbackId: "modal_new_agent",
-        view: {
-          values: {
-            b_herd: { a_herd: { selected_option: { value: "host:me:default" } } },
-            b_kind: { a_kind: { selected_option: { value: "claude" } } },
-          },
-        },
+        privateMetadata: "host:me:default",
+        view: { values: { b_kind: { a_kind: { selected_option: { value: "claude" } } } } },
       });
       expect(herd.forwarded).toEqual([]);
     });
 
-    it("refuses to open the form when no herd is reachable", async () => {
+    it("refuses to open the form on a herd that is asleep", async () => {
       const herd = FakeHerd.withPeer();
-      herd.setUnreachable("host:me:default");
       herd.setUnreachable("host:them:default");
       await build(config(), herd);
-      await transport.emitAction({
-        ctx: ctx(),
-        actionId: "home_new_agent",
-        value: "new",
-        triggerId: "t1",
-      });
+      await openFormOn("host:them:default");
       expect(transport.modals).toEqual([]);
-      expect(transport.ephemerals.at(-1)?.text).toContain("No herd is reachable");
+      expect(transport.ephemerals.at(-1)?.text).toContain("not reachable");
     });
 
     it("wires the session controller into the bridge so forwarded work can run", async () => {

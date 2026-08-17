@@ -29,19 +29,14 @@ import {
 } from "./home.js";
 import { resolveThreadPermalink } from "./links.js";
 import {
-  ACTION_IDS,
   BLOCK_IDS,
   MODAL_IDS,
   MODAL_INPUT_ACTION_IDS,
-  type NewAgentDefaults,
-  type NewAgentHerd,
   type NewAgentSubmission,
   type NewAgentTargets,
-  buildHerdChooserModal,
   buildHistoryModal,
   buildNewAgentModal,
   buildReplyModal,
-  carriedText,
   messageModal,
   parseNewAgentSubmission,
   parseReplySubmission,
@@ -147,12 +142,10 @@ export class Surfaces {
       await this.publishHome(ctx.userId);
     });
 
-    transport.onAction(
-      async ({ ctx, actionId, value, triggerId, viewId, selectedOption, viewState }) => {
-        this.#lastActor = ctx.userId;
-        await this.#onAction(ctx, actionId, value, triggerId, viewId, selectedOption, viewState);
-      },
-    );
+    transport.onAction(async ({ ctx, actionId, value, triggerId, viewId }) => {
+      this.#lastActor = ctx.userId;
+      await this.#onAction(ctx, actionId, value, triggerId, viewId);
+    });
 
     // Bare DMs have no thread target; treat them as commands, not prompts.
     transport.onMessage(async ({ ctx, text }) => {
@@ -411,67 +404,43 @@ export class Surfaces {
   }
 
   /**
-   * Open the launch modal, asking which herd first when nothing implies one.
+   * Open the launch form for the herd whose view the button was in.
    *
-   * Drilling into a herd on Home is a statement of intent — the agent belongs
-   * where the user was already looking — so that case goes straight to the
-   * form. From the overview with several herds there is nothing to infer, and
-   * guessing would mean silently offering one machine's workspaces.
+   * ＋ New agent only exists inside a herd, so the target is never in doubt and
+   * the form never asks. From the overview there would be nothing to infer —
+   * which is exactly why the button is not there.
    */
-  async #openNewAgentModal(triggerId: string, userId: string): Promise<void> {
-    const herds = this.#herdOptions();
-    const selection = this.#homeSelection.get(userId);
-    const drilled = selection && selection !== ALL_HERDS ? selection : undefined;
-    const implied = drilled ?? (herds.length > 1 ? undefined : (this.deps.herd?.herdId ?? ""));
-
-    if (implied === undefined) {
-      await this.deps.transport.openModal(triggerId, buildHerdChooserModal(herds));
-      return;
-    }
+  async #openNewAgentModal(triggerId: string, herdId: string): Promise<void> {
     // Skeleton first: trigger_id expires in about three seconds, well inside
     // the time herdr can take to answer.
     const viewId = await this.deps.transport.openModal(triggerId, skeletonModal("New agent"));
-    await this.#renderNewAgentModal(viewId, implied);
-  }
-
-  #herdOptions(): NewAgentHerd[] {
-    return (this.deps.herd?.homeHerds() ?? []).map((row) => ({
-      herdId: row.herdId,
-      label: row.label,
-      agentCount: row.agentCount,
-      reachable: row.herdrStatus === "connected",
-    }));
+    await this.#renderNewAgentModal(viewId, herdId);
   }
 
   /**
-   * Render the launch form for one herd.
+   * Which herd a launch by this person is for.
    *
-   * Re-rendered when the herd changes because everything below that choice
-   * (workspaces, worktrees, agent kinds) belongs to the herd, not to us.
+   * The same rule Home draws with: one herd needs no choosing, and beyond that
+   * it is whichever one they drilled into. Null means the overview, where there
+   * is no button to have pressed.
    */
-  async #renderNewAgentModal(
-    viewId: string,
-    herdId: string,
-    carried: NewAgentDefaults = {},
-  ): Promise<void> {
+  #targetHerd(userId: string): string | null {
+    const herds = this.deps.herd?.homeHerds() ?? [];
+    if (herds.length <= 1) return herds[0]?.herdId ?? this.deps.herd?.herdId ?? "";
+    const selection = this.#homeSelection.get(userId);
+    return selection && selection !== ALL_HERDS ? selection : null;
+  }
+
+  /** Render the launch form for one herd. */
+  async #renderNewAgentModal(viewId: string, herdId: string): Promise<void> {
     const { herd } = this.deps;
-    const herds = this.#herdOptions();
-    const target = herds.some((row) => row.herdId === herdId)
-      ? herdId
-      : (herds.find((row) => row.reachable)?.herdId ?? herdId);
-    const targets = await this.#launchTargets(target);
+    const targets = await this.#launchTargets(herdId);
     // Last-launch defaults describe a workspace and a directory on *this*
-    // machine, so they only apply when this machine is the target. What the
-    // user typed applies either way.
-    const remembered = target === (herd?.herdId ?? "") ? readLastLaunch(this.deps.instance) : {};
+    // machine, so they only apply when this machine is the target.
+    const defaults = herdId === (herd?.herdId ?? "") ? readLastLaunch(this.deps.instance) : {};
     await this.#updateModal(
       viewId,
-      buildNewAgentModal({
-        ...targets,
-        herds,
-        selectedHerdId: target,
-        defaults: { ...remembered, ...carried },
-      }),
+      buildNewAgentModal({ ...targets, selectedHerdId: herdId, defaults }),
     );
   }
 
@@ -786,25 +755,13 @@ export class Surfaces {
     value: string,
     triggerId: string,
     viewId?: string,
-    selectedOption?: string,
-    viewState?: unknown,
   ): Promise<void> {
     const { log } = this.deps;
-    // Form inputs fire block_actions too. They carry no ref, so falling through
-    // to ref resolution would answer every pick with "I do not recognise that".
-    if (MODAL_INPUT_ACTION_IDS.includes(actionId)) {
-      // The picker reports a selection; the step button carries one in `value`.
-      const chosenHerd =
-        actionId === ACTION_IDS.herd
-          ? selectedOption
-          : actionId === ACTION_IDS.herdStep
-            ? value
-            : undefined;
-      if (chosenHerd && viewId) {
-        await this.#renderNewAgentModal(viewId, chosenHerd, carriedText(viewState));
-      }
-      return;
-    }
+    // A form input fires block_actions too, and carries no ref — falling
+    // through to ref resolution would answer every pick with "I do not
+    // recognise that". Nothing in the form needs handling: it is read once, on
+    // submit.
+    if (MODAL_INPUT_ACTION_IDS.includes(actionId)) return;
     if (
       actionId === HOME_ACTIONS.refresh ||
       actionId === HOME_ACTIONS.newAgent ||
@@ -859,29 +816,25 @@ export class Surfaces {
       await this.#resyncHerdr(ctx.userId);
       return;
     }
-    // A launch needs a reachable herdr, but not necessarily this one — the form
-    // can target a peer.
-    if (!this.#anyHerdReachable(ctx.userId)) {
-      log(`action ${actionId} denied: no reachable herdr`);
+    // A launch belongs to one herd, and it is the one whose view the button was
+    // in. Home does not offer ＋ New agent anywhere else.
+    const target = this.#targetHerd(ctx.userId);
+    if (target === null || !this.#herdReachable(target)) {
+      log(`action ${actionId} denied: no reachable herd`);
       await this.#ephemeral(
         await this.#replyChannel(ctx),
-        "No herd is reachable right now — wake a machine and start herdr.",
+        "That herd is not reachable right now — wake the machine and start herdr.",
       );
       return;
     }
-    await this.#openNewAgentModal(triggerId, ctx.userId);
+    await this.#openNewAgentModal(triggerId, target);
   }
 
-  #anyHerdReachable(userId: string): boolean {
-    const herds = this.deps.herd?.homeHerds();
-    if (!herds || herds.length === 0) return this.deps.tail.status === "connected";
-    const selected = this.#homeSelection.get(userId);
-    // Drilled into one herd: that is the one the button belongs to.
-    if (selected && selected !== ALL_HERDS) {
-      const target = herds.find((herd) => herd.herdId === selected);
-      if (target) return target.herdrStatus === "connected";
-    }
-    return herds.some((herd) => herd.herdrStatus === "connected");
+  /** Fail closed: a herd we cannot find is a herd we will not launch on. */
+  #herdReachable(herdId: string): boolean {
+    const herds = this.deps.herd?.homeHerds() ?? [];
+    if (herds.length === 0) return this.deps.tail.status === "connected";
+    return herds.find((herd) => herd.herdId === herdId)?.herdrStatus === "connected";
   }
 
   #routeHerdRef(value: string): { herdId: string; ref: string; foreign: boolean } {

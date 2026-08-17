@@ -261,11 +261,10 @@ export function buildHome(model: HomeModel): Block[] {
     ? model.agents.filter((agent) => agent.herdId === selected.herdId)
     : model.agents;
 
-  // New agent needs a reachable herdr somewhere: this one when a herd is
-  // selected, any of them from the overview.
-  const canLaunch = selected
-    ? selected.herdrStatus === "connected"
-    : model.herds.some((herd) => herd.herdrStatus === "connected");
+  // Launching belongs to a herd, not to the overview. Everything the form asks
+  // for — workspace, directory, agent kind — is one machine's, so the button
+  // lives where a machine is already in view and the answer is not a guess.
+  const canLaunch = selected !== null && selected.herdrStatus === "connected";
 
   const title = selected
     ? `🐑 Herd · ${selected.label || selected.instance}`

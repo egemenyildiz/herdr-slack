@@ -110,13 +110,6 @@ export type ActionHandler = (input: {
   triggerId: string;
   /** Present for actions inside a modal, enabling in-place pagination. */
   viewId?: string;
-  /** Present when the action is a select menu, which has no `value`. */
-  selectedOption?: string;
-  /**
-   * What is currently typed into the modal. Re-rendering a view replaces its
-   * blocks, so anything already entered is lost unless it is read back here.
-   */
-  viewState?: unknown;
 }) => Promise<void>;
 
 export type MessageHandler = (input: { ctx: InboundContext; text: string }) => Promise<void>;
@@ -221,10 +214,6 @@ export interface ParsedActionPayload {
   triggerId: string;
   /** Only modal actions carry a view; message actions (session cards) do not. */
   viewId?: string;
-  /** A select menu reports its choice here rather than in `value`. */
-  selectedOption?: string;
-  /** The modal's current field values, for carrying them across a re-render. */
-  viewState?: unknown;
 }
 
 /**
@@ -241,15 +230,11 @@ export function parseActionPayload(body: unknown, action: unknown): ParsedAction
 
   const payload = asRecord(body) ?? {};
   const actionRecord = asRecord(action) ?? {};
-  const view = asRecord(payload.view);
-  const viewId = str(view?.id);
-  const selectedOption = str(asRecord(actionRecord.selected_option)?.value);
+  const viewId = str(asRecord(payload.view)?.id);
   return {
     actionId: str(actionRecord.action_id),
     value: str(actionRecord.value),
-    ...(selectedOption ? { selectedOption } : {}),
     triggerId: str(payload.trigger_id),
     ...(viewId ? { viewId } : {}),
-    ...(view?.state ? { viewState: view.state } : {}),
   };
 }
