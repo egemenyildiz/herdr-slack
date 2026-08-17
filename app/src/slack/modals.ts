@@ -1,5 +1,3 @@
-import type { AgentEntry } from "../agents/catalog.js";
-import type { WorkspaceInfo, WorktreeInfo } from "../herdr/types.js";
 import type { SessionTurn } from "../registry/registry.js";
 import { escapeMrkdwn } from "./format.js";
 import { responseSections } from "./session.js";
@@ -14,6 +12,7 @@ export const MODAL_IDS = {
 } as const;
 
 export const BLOCK_IDS = {
+  herd: "b_herd",
   workspace: "b_workspace",
   directory: "b_directory",
   directoryOther: "b_directory_other",
@@ -25,6 +24,7 @@ export const BLOCK_IDS = {
 } as const;
 
 export const ACTION_IDS = {
+  herd: "a_herd",
   workspace: "a_workspace",
   directory: "a_directory",
   directoryOther: "a_directory_other",
@@ -34,6 +34,9 @@ export const ACTION_IDS = {
   prompt: "a_prompt",
   reply: "a_reply",
 } as const;
+
+/** Every action id that is a form input, so inbound handling can ignore them. */
+export const MODAL_INPUT_ACTION_IDS: readonly string[] = Object.values(ACTION_IDS);
 
 /** Slack refuses a static_select with more than 100 options. */
 export const OPTION_CAP = 100;
@@ -123,14 +126,37 @@ export interface NewAgentDefaults {
   kind?: string | undefined;
 }
 
-export interface NewAgentModel {
-  workspaces: WorkspaceInfo[];
-  worktrees: WorktreeInfo[];
-  catalog: AgentEntry[];
+/** A herd the form can launch into. */
+export interface NewAgentHerd {
+  herdId: string;
+  label: string;
+  agentCount: number;
+  reachable: boolean;
+}
+
+/**
+ * Launch targets, in the shape the form needs.
+ *
+ * Deliberately not herdr's own types: the options may describe another herd,
+ * read from its heartbeat rather than from a socket we can reach.
+ */
+export interface NewAgentTargets {
+  workspaces: { id: string; label: string }[];
+  worktrees: { label: string; path: string; branch?: string }[];
+  kinds: { kind: string; label: string }[];
+}
+
+export interface NewAgentModel extends NewAgentTargets {
   /** Currently selected kind. */
   selectedKind?: string;
   favouriteDirs?: string[];
   defaults?: NewAgentDefaults | undefined;
+  /**
+   * Herds to choose between. Omitted or single means no picker: there is only
+   * one place the agent could start.
+   */
+  herds?: NewAgentHerd[];
+  selectedHerdId?: string | undefined;
 }
 
 /**
@@ -145,12 +171,12 @@ export interface NewAgentModel {
  * project deliberately does not have.
  */
 export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown> {
-  const kinds = model.catalog.map((entry) => ({
+  const kinds = model.kinds.map((entry) => ({
     label: entry.label === entry.kind ? entry.kind : `${entry.label} (${entry.kind})`,
     value: entry.kind,
   }));
 
-  const selected = model.selectedKind ?? model.defaults?.kind ?? model.catalog[0]?.kind ?? "";
+  const selected = model.selectedKind ?? model.defaults?.kind ?? model.kinds[0]?.kind ?? "";
 
   const directories: Option[] = [
     ...(model.favouriteDirs ?? []).map((dir) => ({ label: dir, value: dir })),
@@ -160,19 +186,41 @@ export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown
     })),
   ];
 
-  const blocks: Block[] = [
+  const herds = model.herds ?? [];
+  const blocks: Block[] = [];
+
+  // Which machine comes first: everything below it (workspaces, worktrees,
+  // agent kinds) is that herd's, so choosing it later would mean re-picking.
+  if (herds.length > 1) {
+    blocks.push(
+      selectBlock(
+        BLOCK_IDS.herd,
+        ACTION_IDS.herd,
+        "Herd",
+        herds.map((herd) => ({
+          label: herd.reachable
+            ? `${herd.label} (${herd.agentCount} agent${herd.agentCount === 1 ? "" : "s"})`
+            : `${herd.label} — unreachable`,
+          value: herd.herdId,
+        })),
+        { ...(model.selectedHerdId ? { initial: model.selectedHerdId } : {}) },
+      ),
+    );
+  }
+
+  blocks.push(
     selectBlock(
       BLOCK_IDS.workspace,
       ACTION_IDS.workspace,
       "Workspace",
-      model.workspaces.map((w) => ({ label: w.label || w.workspace_id, value: w.workspace_id })),
+      model.workspaces.map((w) => ({ label: w.label || w.id, value: w.id })),
       {
         optional: true,
         placeholder: "New workspace",
         ...(model.defaults?.workspaceId ? { initial: model.defaults.workspaceId } : {}),
       },
     ),
-  ];
+  );
 
   if (directories.length > 0) {
     blocks.push(
@@ -207,6 +255,8 @@ export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown
   return {
     type: "modal",
     callback_id: MODAL_IDS.newAgent,
+    // Carries the target herd even when there is no picker to read it back from.
+    private_metadata: model.selectedHerdId ?? "",
     title: text("New agent"),
     submit: text("Start"),
     close: text("Cancel"),
@@ -338,14 +388,24 @@ export interface NewAgentSubmission {
   kind: string;
   label?: string;
   firstPrompt?: string;
+  /** Which herd to launch on; absent means the local one. */
+  herdId?: string;
 }
 
 type ViewState = {
   values?: Record<string, Record<string, { value?: string; selected_option?: { value?: string } }>>;
 };
 
-/** Read a submitted view. Returns null when required fields are missing. */
-export function parseNewAgentSubmission(view: unknown): NewAgentSubmission | null {
+/**
+ * Read a submitted view. Returns null when required fields are missing.
+ *
+ * `privateMetadata` is the fallback target herd, for the single-herd case where
+ * the picker is not rendered at all.
+ */
+export function parseNewAgentSubmission(
+  view: unknown,
+  privateMetadata = "",
+): NewAgentSubmission | null {
   const values = (view as ViewState)?.values ?? {};
   const pick = (block: string, action: string): string | undefined => {
     const field = values[block]?.[action];
@@ -354,6 +414,8 @@ export function parseNewAgentSubmission(view: unknown): NewAgentSubmission | nul
 
   const kind = pick(BLOCK_IDS.kind, ACTION_IDS.kind);
   if (!kind) return null;
+
+  const herdId = pick(BLOCK_IDS.herd, ACTION_IDS.herd) ?? privateMetadata.trim();
 
   // A typed path wins over the picker: someone who typed one meant it.
   const typed = pick(BLOCK_IDS.directoryOther, ACTION_IDS.directoryOther)?.trim();
@@ -372,5 +434,6 @@ export function parseNewAgentSubmission(view: unknown): NewAgentSubmission | nul
     ...(cwd ? { cwd } : {}),
     ...(label ? { label } : {}),
     ...(firstPrompt ? { firstPrompt } : {}),
+    ...(herdId ? { herdId } : {}),
   };
 }
