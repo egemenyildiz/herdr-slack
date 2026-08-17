@@ -64,15 +64,32 @@ Verify:
 node app/dist/cli.js doctor
 ```
 
-Reset this machine (config, keychain entries, state, service):
+### Reset and uninstall
+
+The Slack bridge runs as a launchd/systemd **user service**, so it outlives herdr. `herdr plugin
+uninstall` only removes the plugin checkout — it does **not** stop the daemon or unload the service.
+Always reset first:
 
 ```bash
 herdr plugin action invoke reset --plugin herdr-slack
+herdr plugin uninstall herdr-slack
 ```
 
-The action opens a popup, runs the reset non-interactively, and leaves its result visible until you
-press Enter. The Slack app itself must still be deleted from Slack. From the plugin directory, the
-equivalent command is `node app/dist/cli.js reset --yes`.
+Reset stops the daemon, removes the user service and shim, and clears that instance’s config,
+keychain entries, and state. The action opens a popup, runs non-interactively, and leaves its result
+visible until you press Enter. From the plugin directory, the equivalent is
+`node app/dist/cli.js reset --yes`.
+
+Reset does **not** delete the Slack app — remove that yourself at
+[api.slack.com/apps](https://api.slack.com/apps) if you are done with it.
+
+To stop the process temporarily without wiping setup:
+
+```bash
+node app/dist/cli.js daemon stop
+```
+
+That leaves the service installed, so it can come back on login or reboot until you reset.
 
 ## Usage
 
