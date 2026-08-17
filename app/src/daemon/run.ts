@@ -9,7 +9,7 @@ import {
   validateInstance,
   withCredentials,
 } from "../config/config.js";
-import { stateDir } from "../config/instance.js";
+import { configDir, stateDir } from "../config/instance.js";
 import { detectSecretStore } from "../config/secrets.js";
 import { HerdrClient, defaultSocketPath, sessionSocketPath } from "../herdr/client.js";
 import { EventTail } from "../herdr/events.js";
@@ -19,7 +19,10 @@ import { DryRunTransport, formatWrite } from "../slack/dry-run-transport.js";
 import { SocketModeTransport } from "../slack/socket-transport.js";
 import { Surfaces } from "../slack/surfaces.js";
 import type { SlackTransport } from "../slack/transport.js";
+import { WebApiTransport } from "../slack/web-api-transport.js";
 import { RateBudget } from "./budget.js";
+import { HerdBridge } from "./herd-bridge.js";
+import { defaultHerdRegistryDir } from "./herd-registry.js";
 import { Logger } from "./logger.js";
 import { acquireLock, onShutdown, writeRecord } from "./supervisor.js";
 
@@ -126,12 +129,32 @@ any problems below are what a real start would refuse on — this run continues 
   });
 
   const registry = new SessionRegistry(instance);
+
+  // Elect Slack ownership before opening Socket Mode — two Socket Mode clients
+  // on the same app race for events and overwrite App Home.
+  const herdRegistryDir =
+    config.herdRegistryDir ??
+    (scratch ? path.join(scratch, "herd-registry") : defaultHerdRegistryDir(configDir()));
+  const herd = new HerdBridge({
+    config,
+    instance,
+    state,
+    tail,
+    registry,
+    log: (line) => log.event("surface", { msg: line }),
+    registryDir: herdRegistryDir,
+  });
+  const role = dryRun ? "primary" : await herd.elect();
+
   const transport: SlackTransport = dryRun
     ? new DryRunTransport((write) => {
         log.event("slack.dry_run", { api: write.api, target: write.target, bytes: write.bytes });
         process.stdout.write(`${formatWrite(write)}\n`);
       })
-    : new SocketModeTransport(config, (line) => log.event("surface", { msg: line }));
+    : role === "primary"
+      ? new SocketModeTransport(config, (line) => log.event("surface", { msg: line }))
+      : new WebApiTransport(config);
+
   const surfaces = new Surfaces({
     config,
     instance,
@@ -141,10 +164,12 @@ any problems below are what a real start would refuse on — this run continues 
     registry,
     budget,
     client,
+    herd,
     log: (line) => log.line(line),
   });
 
   surfaces.start();
+  herd.start();
   tail.start();
 
   try {
@@ -153,6 +178,7 @@ any problems below are what a real start would refuse on — this run continues 
     log.error("slack.connect_failed", { message: (error as Error).message });
     process.stderr.write(`could not connect to Slack: ${(error as Error).message}\n`);
     process.stderr.write("run: herdr-slack doctor\n");
+    herd.stop();
     tail.stop();
     state.dispose();
     await release();
@@ -166,6 +192,9 @@ any problems below are what a real start would refuse on — this run continues 
     socketPath: config.herdrSocketPath,
     budgetPerMin: budget.totalPerMin,
     contentMode: config.contentMode,
+    slackRole: role,
+    herdId: herd.herdId,
+    herdRegistryDir,
   });
 
   if (dryRun) {
@@ -181,6 +210,7 @@ any problems below are what a real start would refuse on — this run continues 
   onShutdown(async () => {
     log.event("daemon.shutdown");
     if (scratch) rmSync(scratch, { recursive: true, force: true });
+    herd.stop();
     surfaces.stop();
     tail.stop();
     state.dispose();

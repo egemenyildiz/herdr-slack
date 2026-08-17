@@ -3,6 +3,8 @@ import { readLastLaunch, writeLastLaunch } from "../agents/last-launch.js";
 import { launchAgent, sanitizeAgentName } from "../agents/launcher.js";
 import type { InstanceConfig } from "../config/config.js";
 import type { RateBudget } from "../daemon/budget.js";
+import type { HerdBridge } from "../daemon/herd-bridge.js";
+import { decodeHerdRef } from "../daemon/herd-registry.js";
 import type { HerdrClient } from "../herdr/client.js";
 import type { EventTail } from "../herdr/events.js";
 import type { SessionState } from "../herdr/state.js";
@@ -16,7 +18,7 @@ import {
   checkInbound,
   requireHerdr,
 } from "./guards.js";
-import { GLYPH, type HomeAgent, agentFromPane, buildHome } from "./home.js";
+import { GLYPH, type HomeAgent, type HomeHerd, agentFromPane, buildHome } from "./home.js";
 import { resolveThreadPermalink } from "./links.js";
 import {
   BLOCK_IDS,
@@ -67,6 +69,8 @@ export interface SurfacesDeps {
   agentGoneMs?: number;
   /** Wait after cursor goes idle before posting activity. Defaults to CURSOR_IDLE_ACTIVITY_MS. */
   cursorIdleActivityMs?: number;
+  /** Multi-herd coordination; omitted in unit tests that only exercise local Home. */
+  herd?: HerdBridge;
   log: (line: string) => void;
 }
 
@@ -99,6 +103,7 @@ export class Surfaces {
       log: deps.log,
       isHerdrConnected,
     });
+    deps.herd?.attachSessions(this.#sessions);
     this.#guards = {
       config: deps.config,
       throttle: new ActionThrottle(),
@@ -121,44 +126,8 @@ export class Surfaces {
     });
 
     transport.onAction(async ({ ctx, actionId, value, triggerId, viewId }) => {
-      // Home actions use literal values, not refs — handle before ref resolution.
       this.#lastActor = ctx.userId;
-      if (actionId === "home_refresh" || actionId === "home_new_agent") {
-        const decision = checkInbound(this.#guards, ctx);
-        if (!decision.allowed) {
-          log(`action ${actionId} denied: ${decision.reason}`);
-          return;
-        }
-        if (actionId === "home_refresh") {
-          await this.publishHome(ctx.userId);
-          return;
-        }
-        // New agent needs a live herdr; Refresh does not.
-        const herdr = requireHerdr(this.#guards);
-        if (!herdr.allowed) {
-          log(`action ${actionId} denied: ${herdr.reason}`);
-          await this.#ephemeral(
-            await this.#replyChannel(ctx),
-            herdr.message ?? "herdr is not connected.",
-          );
-          return;
-        }
-        await this.#openNewAgentModal(triggerId);
-        return;
-      }
-      // Menu choices pack ref:digit; extract the ref before authorisation.
-      const refForAuth = SessionController.isMenuChoiceAction(actionId)
-        ? (SessionController.decodeMenuChoice(value)?.ref ?? "")
-        : value;
-      const channel = await this.#replyChannel(ctx);
-      const result = authorizeAction(this.#guards, ctx, refForAuth);
-      if (!result.decision.allowed) {
-        log(`action ${actionId} denied: ${result.decision.reason}`);
-        await this.#ephemeral(channel, result.decision.message ?? "Not allowed.");
-        return;
-      }
-      log(`action ${actionId} terminal=${result.terminalId} actor=${ctx.userId}`);
-      await this.#dispatch(actionId, result.terminalId ?? "", value, channel, triggerId, viewId);
+      await this.#onAction(ctx, actionId, value, triggerId, viewId);
     });
 
     // Bare DMs have no thread target; treat them as commands, not prompts.
@@ -529,7 +498,9 @@ export class Surfaces {
 
   /** Build the Home model from live state, never from the registry alone. */
   homeAgents(): HomeAgent[] {
-    const { state, registry } = this.deps;
+    const { state, registry, herd, config } = this.deps;
+    const localHerdId = herd?.herdId ?? "";
+    const localLabel = config.label || this.deps.instance;
     // Mint refs for new agents so Home buttons always carry a valid target.
     for (const pane of state.agentPanes()) {
       if (!registry.get(pane.terminal_id)) {
@@ -544,7 +515,7 @@ export class Surfaces {
         });
       }
     }
-    return state.agentPanes().map((pane) => {
+    const local = state.agentPanes().map((pane) => {
       const record = registry.get(pane.terminal_id);
       const workspace = state.workspaces.get(pane.workspace_id);
       // Home only lists live panes, so an ended record here is one the user
@@ -562,30 +533,169 @@ export class Surfaces {
               record.slackThreadTs,
               record.slackPermalink,
             ),
+        {
+          herdId: localHerdId,
+          herdLabel: localLabel,
+          actionValue: record?.ref ?? "",
+        },
       );
     });
+    return herd ? herd.homeAgents(local) : local;
   }
 
   async publishHome(userId: string): Promise<void> {
-    const { transport, tail, budget, config, log } = this.deps;
+    const { transport, tail, budget, log, herd } = this.deps;
+    // Only the primary publishes App Home — satellites would overwrite peers.
+    if (herd?.role === "satellite") return;
     if (!budget.tryConsume()) {
       log("home publish skipped: rate budget exhausted");
       return;
     }
     try {
+      const agents = this.homeAgents();
       await transport.publishHome(
         userId,
         buildHome({
-          instanceLabel: config.label || "herdr",
-          agents: this.homeAgents(),
+          herds: herd?.homeHerds() ?? [this.#soloHerd(agents.length)],
+          localHerdId: herd?.herdId ?? this.deps.instance,
+          agents,
           herdr: tail.status,
           slackConnected: transport.connected,
-          syncedAgoMs: this.#lastSyncAt === null ? null : Date.now() - this.#lastSyncAt,
+          herdrSyncedAgoMs: this.#lastSyncAt === null ? null : Date.now() - this.#lastSyncAt,
+          role: herd?.role ?? "primary",
         }),
       );
     } catch (error) {
       log(`home publish failed: ${(error as Error).message}`);
     }
+  }
+
+  /** Home's herd row when no bridge is wired (unit tests, single-herd fallback). */
+  #soloHerd(agentCount: number): HomeHerd {
+    return {
+      herdId: this.deps.instance,
+      label: this.deps.config.label || this.deps.instance,
+      pid: process.pid,
+      instance: this.deps.instance,
+      socketPath: this.deps.config.herdrSocketPath,
+      herdrStatus: this.deps.tail.status,
+      role: "primary",
+      hostname: "local",
+      user: "local",
+      agentCount,
+      isLocal: true,
+      updatedAt: Date.now(),
+    };
+  }
+
+  /** Refresh: re-read herdr state, bump the sync clock, republish Home. */
+  async #resyncHerdr(userId: string): Promise<void> {
+    this.reconcileSessions();
+    this.#lastSyncAt = Date.now();
+    await this.publishHome(userId);
+  }
+
+  async #onAction(
+    ctx: InboundContext,
+    actionId: string,
+    value: string,
+    triggerId: string,
+    viewId?: string,
+  ): Promise<void> {
+    const { log } = this.deps;
+    if (actionId === "home_refresh" || actionId === "home_new_agent") {
+      await this.#onHomeChrome(ctx, actionId, triggerId);
+      return;
+    }
+    const rawForAuth = SessionController.isMenuChoiceAction(actionId)
+      ? (SessionController.decodeMenuChoice(value)?.ref ?? "")
+      : value;
+    const channel = await this.#replyChannel(ctx);
+    const routed = this.#routeHerdRef(rawForAuth);
+    if (routed.foreign) {
+      const inbound = checkInbound(this.#guards, ctx);
+      if (!inbound.allowed) {
+        log(`action ${actionId} denied: ${inbound.reason}`);
+        await this.#ephemeral(channel, inbound.message ?? "Not allowed.");
+        return;
+      }
+      await this.#forwardForeign(actionId, routed.herdId, routed.ref, channel, ctx.userId);
+      return;
+    }
+    const result = authorizeAction(this.#guards, ctx, routed.ref);
+    if (!result.decision.allowed) {
+      log(`action ${actionId} denied: ${result.decision.reason}`);
+      await this.#ephemeral(channel, result.decision.message ?? "Not allowed.");
+      return;
+    }
+    log(`action ${actionId} terminal=${result.terminalId} actor=${ctx.userId}`);
+    await this.#dispatch(actionId, result.terminalId ?? "", value, channel, triggerId, viewId);
+  }
+
+  async #onHomeChrome(ctx: InboundContext, actionId: string, triggerId: string): Promise<void> {
+    const { log } = this.deps;
+    const decision = checkInbound(this.#guards, ctx);
+    if (!decision.allowed) {
+      log(`action ${actionId} denied: ${decision.reason}`);
+      return;
+    }
+    if (actionId === "home_refresh") {
+      await this.#resyncHerdr(ctx.userId);
+      return;
+    }
+    const herdr = requireHerdr(this.#guards);
+    if (!herdr.allowed) {
+      log(`action ${actionId} denied: ${herdr.reason}`);
+      await this.#ephemeral(
+        await this.#replyChannel(ctx),
+        herdr.message ?? "herdr is not connected.",
+      );
+      return;
+    }
+    await this.#openNewAgentModal(triggerId);
+  }
+
+  #routeHerdRef(value: string): { herdId: string; ref: string; foreign: boolean } {
+    const localHerdId = this.deps.herd?.herdId ?? "";
+    const decoded = decodeHerdRef(value, localHerdId || "local");
+    const foreign = Boolean(localHerdId && decoded.herdId !== localHerdId);
+    return { ...decoded, foreign };
+  }
+
+  async #forwardForeign(
+    actionId: string,
+    herdId: string,
+    ref: string,
+    channel: string,
+    userId: string,
+  ): Promise<void> {
+    const { herd, log } = this.deps;
+    if (!herd) {
+      await this.#ephemeral(channel, "That agent belongs to another herd, which is not linked.");
+      return;
+    }
+    if (actionId === SESSION_ACTIONS.reply) {
+      await this.#ephemeral(
+        channel,
+        "Open the session card from that herd, then use *Reply* there — cross-herd Reply from Home is not wired yet.",
+      );
+      return;
+    }
+    const op =
+      actionId === "home_open_session"
+        ? "open_session"
+        : actionId === SESSION_ACTIONS.refresh
+          ? "refresh"
+          : actionId === SESSION_ACTIONS.end
+            ? "end_session"
+            : null;
+    if (!op) {
+      await this.#ephemeral(channel, "That action cannot be forwarded to another herd yet.");
+      return;
+    }
+    herd.forwardCommand({ op, herdId, ref, channel, userId });
+    log(`forwarded ${actionId} to herd ${herdId} ref=${ref}`);
+    await this.#ephemeral(channel, `Sent to herd \`${herdId}\`.`);
   }
 
   /** Which session owns a Slack thread, if any. */

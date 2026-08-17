@@ -12,6 +12,8 @@ export const GLYPH: Record<AgentStatus, string> = {
 
 export interface HomeAgent {
   ref: string;
+  /** Button value — may be herd-encoded for foreign agents. */
+  actionValue: string;
   terminalId: string;
   agent: string;
   title: string;
@@ -20,14 +22,40 @@ export interface HomeAgent {
   workspaceId: string;
   workspaceLabel: string;
   permalink?: string;
+  /** Which herd this agent belongs to (for grouping / display). */
+  herdId: string;
+  herdLabel: string;
+}
+
+export interface HomeHerd {
+  herdId: string;
+  label: string;
+  pid: number;
+  instance: string;
+  socketPath: string;
+  herdrStatus: TailStatus;
+  role: "primary" | "satellite";
+  hostname: string;
+  user: string;
+  agentCount: number;
+  isLocal: boolean;
+  updatedAt: number;
 }
 
 export interface HomeModel {
-  instanceLabel: string;
+  /** All live herds for this Slack app, including this daemon. */
+  herds: HomeHerd[];
+  localHerdId: string;
   agents: HomeAgent[];
   herdr: TailStatus;
   slackConnected: boolean;
-  syncedAgoMs: number | null;
+  /**
+   * ms since herdr state was last reconciled for *this* daemon.
+   * Refresh bumps this; it is not "time since Home was published".
+   */
+  herdrSyncedAgoMs: number | null;
+  /** When Home itself was last published (informational). */
+  role: "primary" | "satellite";
 }
 
 type Block = Record<string, unknown>;
@@ -61,10 +89,10 @@ const button = (
 
 // Slack rejects empty button `value` and rejects the entire Home view with it.
 const openButton = (agent: HomeAgent): Block | undefined => {
-  if (!agent.ref) return undefined;
+  if (!agent.actionValue) return undefined;
   return agent.permalink
-    ? button("Open", "home_open_session", agent.ref, undefined, agent.permalink)
-    : button("Open", "home_open_session", agent.ref);
+    ? button("Open", "home_open_session", agent.actionValue, undefined, agent.permalink)
+    : button("Open", "home_open_session", agent.actionValue);
 };
 
 /** Slack rejects `accessory: undefined`, so the key has to be absent entirely. */
@@ -90,23 +118,53 @@ export function groupByWorkspace(agents: HomeAgent[]): Map<string, HomeAgent[]> 
   return groups;
 }
 
+function herdLine(herd: HomeHerd): string {
+  const status =
+    herd.herdrStatus === "connected"
+      ? "connected"
+      : herd.herdrStatus === "waiting"
+        ? "herdr down"
+        : "connecting";
+  const where = herd.isLocal ? "this daemon" : `${herd.user}@${herd.hostname}`;
+  const role = herd.role === "primary" ? "primary" : "satellite";
+  const socket = shortenPath(herd.socketPath);
+  // Same profile label on two herds is ambiguous — pid + host/user disambiguates.
+  return (
+    `*${escapeMrkdwn(herd.label || herd.instance)}* · pid \`${herd.pid}\` · ${role}\n` +
+    `\`${escapeMrkdwn(socket)}\` · ${status} · ${herd.agentCount} agent${herd.agentCount === 1 ? "" : "s"} · ${escapeMrkdwn(where)}`
+  );
+}
+
+function shortenPath(socketPath: string): string {
+  const home = process.env.HOME;
+  if (home && socketPath.startsWith(home)) return `~${socketPath.slice(home.length)}`;
+  return socketPath;
+}
+
 function livenessFooter(model: HomeModel): Block {
   if (!model.slackConnected) return context("⚠️ reconnecting to Slack…");
-  if (model.herdr !== "connected") {
-    return context("⚠️ computer / herdr unreachable — wake it and run `herdr`");
+  if (model.role === "satellite") {
+    return context("satellite — Home is published by the primary daemon for this Slack app");
   }
-  const ago = model.syncedAgoMs;
+  if (model.herdr !== "connected") {
+    return context("⚠️ this herd's herdr is unreachable — wake the machine and run `herdr`");
+  }
+  const ago = model.herdrSyncedAgoMs;
   const text =
     ago === null
-      ? "synced"
+      ? "herdr not synced yet — tap Refresh"
       : ago < 2_000
-        ? "synced just now"
-        : `synced ${Math.round(ago / 1000)}s ago`;
+        ? "herdr synced just now"
+        : `herdr synced ${Math.round(ago / 1000)}s ago · Refresh re-syncs`;
   return context(text);
 }
 
 function emptyState(model: HomeModel): Block[] | null {
-  if (model.herdr !== "connected") {
+  const foreignAgents = model.agents.filter(
+    (agent) => agent.herdId && agent.herdId !== model.localHerdId,
+  );
+  // Local herdr down and nothing from peers → do not render a stale local list.
+  if (model.herdr !== "connected" && foreignAgents.length === 0) {
     return [
       section("*Your computer is not reachable.*"),
       context(
@@ -125,52 +183,44 @@ function emptyState(model: HomeModel): Block[] | null {
 
 /** Slack rejects Home views with more than 100 blocks. */
 export const MAX_HOME_BLOCKS = 100;
-const RESERVED_BLOCKS = 6;
+const RESERVED_BLOCKS = 8;
 
-export function buildHome(model: HomeModel): Block[] {
-  const herdrUp = model.herdr === "connected";
-  const blocks: Block[] = [
-    {
-      type: "header",
-      text: { type: "plain_text", text: `🐑 Herd · ${model.instanceLabel}`, emoji: true },
-    },
-    {
-      type: "actions",
-      // New agent needs a live herdr; Refresh only re-publishes this view.
-      elements: herdrUp
-        ? [
-            button("⟳ Refresh", "home_refresh", "refresh"),
-            button("＋ New agent", "home_new_agent", "new", "primary"),
-          ]
-        : [button("⟳ Refresh", "home_refresh", "refresh")],
-    },
-  ];
+function herdsHeader(model: HomeModel): Block[] {
+  if (model.herds.length === 0) return [];
+  const blocks: Block[] = [divider(), section("*Herds*")];
+  for (const herd of model.herds) blocks.push(section(herdLine(herd)));
+  return blocks;
+}
 
-  const empty = emptyState(model);
-  if (empty) return [...blocks, ...empty, divider(), livenessFooter(model)];
-
+function attentionBlocks(model: HomeModel): Block[] {
   const attention = needsYou(model.agents);
-  if (attention.length > 0) {
-    blocks.push(divider(), section(`*🔴 NEEDS YOU (${attention.length})*`));
-    for (const agent of attention) {
-      blocks.push(
-        withOpen(
-          {
-            type: "section",
-            text: {
-              type: "mrkdwn",
-              text: `${GLYPH[agent.status]} *${escapeMrkdwn(agent.agent)}* · ${escapeMrkdwn(agent.title)}\n\`${escapeMrkdwn(agent.cwd)}\``,
-            },
+  if (attention.length === 0) return [];
+  const blocks: Block[] = [divider(), section(`*🔴 NEEDS YOU (${attention.length})*`)];
+  for (const agent of attention) {
+    blocks.push(
+      withOpen(
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `${GLYPH[agent.status]} *${escapeMrkdwn(agent.agent)}* · ${escapeMrkdwn(agent.title)}\n\`${escapeMrkdwn(agent.cwd)}\`${herdSuffix(agent, model)}`,
           },
-          agent,
-        ),
-      );
-    }
+        },
+        agent,
+      ),
+    );
   }
+  return blocks;
+}
 
+function workspaceBlocks(
+  model: HomeModel,
+  startLength: number,
+): { blocks: Block[]; hidden: number } {
+  const blocks: Block[] = [];
   let hidden = 0;
   for (const [workspace, agents] of groupByWorkspace(model.agents)) {
-    if (blocks.length + RESERVED_BLOCKS >= MAX_HOME_BLOCKS) {
+    if (startLength + blocks.length + RESERVED_BLOCKS >= MAX_HOME_BLOCKS) {
       hidden += agents.length;
       continue;
     }
@@ -179,7 +229,7 @@ export function buildHome(model: HomeModel): Block[] {
       section(`*${workspace}*  ·  ${agents.length} agent${agents.length === 1 ? "" : "s"}`),
     );
     for (const agent of agents) {
-      if (blocks.length + RESERVED_BLOCKS >= MAX_HOME_BLOCKS) {
+      if (startLength + blocks.length + RESERVED_BLOCKS >= MAX_HOME_BLOCKS) {
         hidden += 1;
         continue;
       }
@@ -189,7 +239,7 @@ export function buildHome(model: HomeModel): Block[] {
             type: "section",
             text: {
               type: "mrkdwn",
-              text: `${GLYPH[agent.status]} \`${escapeMrkdwn(agent.agent)}\`  ${escapeMrkdwn(agent.title)}`,
+              text: `${GLYPH[agent.status]} \`${escapeMrkdwn(agent.agent)}\`  ${escapeMrkdwn(agent.title)}${herdSuffix(agent, model)}`,
             },
           },
           agent,
@@ -197,6 +247,39 @@ export function buildHome(model: HomeModel): Block[] {
       );
     }
   }
+  return { blocks, hidden };
+}
+
+export function buildHome(model: HomeModel): Block[] {
+  const localUp = model.herdr === "connected";
+  const title =
+    model.herds.length <= 1
+      ? `🐑 Herd · ${model.herds[0]?.label || "herdr"}`
+      : `🐑 Herds · ${model.herds.length}`;
+
+  const blocks: Block[] = [
+    {
+      type: "header",
+      text: { type: "plain_text", text: title, emoji: true },
+    },
+    {
+      type: "actions",
+      elements: localUp
+        ? [
+            button("⟳ Refresh", "home_refresh", "refresh"),
+            button("＋ New agent", "home_new_agent", "new", "primary"),
+          ]
+        : [button("⟳ Refresh", "home_refresh", "refresh")],
+    },
+    ...herdsHeader(model),
+  ];
+
+  const empty = emptyState(model);
+  if (empty) return [...blocks, ...empty, divider(), livenessFooter(model)];
+
+  blocks.push(...attentionBlocks(model));
+  const { blocks: workspaces, hidden } = workspaceBlocks(model, blocks.length);
+  blocks.push(...workspaces);
 
   if (hidden > 0) {
     blocks.push(
@@ -210,15 +293,22 @@ export function buildHome(model: HomeModel): Block[] {
   return blocks;
 }
 
+function herdSuffix(agent: HomeAgent, model: HomeModel): string {
+  if (model.herds.length <= 1 || agent.herdId === model.localHerdId) return "";
+  return `\n_${escapeMrkdwn(agent.herdLabel)}_`;
+}
+
 export function agentFromPane(
   pane: PaneInfo,
   ref: string,
   workspaceLabel: string,
   status: AgentStatus,
   permalink?: string,
+  herd?: { herdId: string; herdLabel: string; actionValue: string },
 ): HomeAgent {
   return {
     ref,
+    actionValue: herd?.actionValue ?? ref,
     terminalId: pane.terminal_id,
     agent: pane.agent ?? "agent",
     title: pane.terminal_title_stripped ?? pane.title ?? "(untitled)",
@@ -226,6 +316,8 @@ export function agentFromPane(
     status,
     workspaceId: pane.workspace_id,
     workspaceLabel,
+    herdId: herd?.herdId ?? "",
+    herdLabel: herd?.herdLabel ?? "",
     ...(permalink ? { permalink } : {}),
   };
 }

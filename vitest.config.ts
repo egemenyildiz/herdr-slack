@@ -28,11 +28,18 @@ export default defineConfig({
         // tested on its own; an "is it wired up" test here would assert the
         // shape of main() rather than any behaviour.
         "app/src/daemon/run.ts",
+        // Coordinates ownership + heartbeats + command drain against live
+        // Surfaces/SessionController. Registry encode/ownership/queue logic is
+        // covered in herd-registry.test.ts; elect/attach are wiring.
+        "app/src/daemon/herd-bridge.ts",
         // A Bolt passthrough that needs a live Socket Mode connection to
         // exercise. The logic worth testing was deliberately kept out of it —
         // isActionableMessage and isPinnedTeam live in slack/transport.ts and
         // are covered there, including the message_changed feedback loop.
         "app/src/slack/socket-transport.ts",
+        // Outbound Web API only (satellite). Same shape as socket-transport's
+        // chat.* methods; behaviour is covered via FakeTransport in Surfaces tests.
+        "app/src/slack/web-api-transport.ts",
       ],
       thresholds: {
         lines: 80,

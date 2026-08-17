@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   type HomeAgent,
+  type HomeHerd,
   type HomeModel,
   MAX_HOME_BLOCKS,
   agentFromPane,
@@ -10,8 +11,25 @@ import {
 } from "../../src/slack/home.js";
 import { pane } from "../helpers/factories.js";
 
+const herd = (overrides: Partial<HomeHerd> = {}): HomeHerd => ({
+  herdId: "host:user:default",
+  label: "personal",
+  pid: 1234,
+  instance: "default",
+  socketPath: "/tmp/herdr.sock",
+  herdrStatus: "connected",
+  role: "primary",
+  hostname: "host",
+  user: "user",
+  agentCount: 1,
+  isLocal: true,
+  updatedAt: Date.now(),
+  ...overrides,
+});
+
 const agent = (overrides: Partial<HomeAgent> = {}): HomeAgent => ({
   ref: "r1",
+  actionValue: "r1",
   terminalId: "term_1",
   agent: "claude",
   title: "a task",
@@ -19,15 +37,19 @@ const agent = (overrides: Partial<HomeAgent> = {}): HomeAgent => ({
   status: "working",
   workspaceId: "w1",
   workspaceLabel: "project",
+  herdId: "host:user:default",
+  herdLabel: "personal",
   ...overrides,
 });
 
 const model = (overrides: Partial<HomeModel> = {}): HomeModel => ({
-  instanceLabel: "personal",
+  herds: [herd()],
+  localHerdId: "host:user:default",
   agents: [agent()],
   herdr: "connected",
   slackConnected: true,
-  syncedAgoMs: 1_000,
+  herdrSyncedAgoMs: 1_000,
+  role: "primary",
   ...overrides,
 });
 
@@ -36,8 +58,8 @@ const text = (blocks: Record<string, unknown>[]): string => JSON.stringify(block
 describe("needsYou", () => {
   it("surfaces blocked before done", () => {
     const result = needsYou([
-      agent({ ref: "d", status: "done" }),
-      agent({ ref: "b", status: "blocked" }),
+      agent({ ref: "d", actionValue: "d", status: "done" }),
+      agent({ ref: "b", actionValue: "b", status: "blocked" }),
     ]);
     expect(result.map((a) => a.ref)).toEqual(["b", "d"]);
   });
@@ -66,13 +88,46 @@ describe("buildHome", () => {
     expect(rendered).not.toContain("home_new_agent");
   });
 
-  it("says the computer is unreachable instead of rendering a stale list", () => {
-    // Showing the last known agents while herdr is unreachable would be
-    // confidently wrong, which is worse than showing nothing.
+  it("says the computer is unreachable instead of rendering a stale local list", () => {
     const blocks = buildHome(model({ herdr: "waiting", agents: [agent()] }));
     const rendered = text(blocks);
     expect(rendered).toContain("not reachable");
     expect(rendered).not.toContain("a task");
+  });
+
+  it("lists herds with pid so colliding labels stay distinguishable", () => {
+    const blocks = buildHome(
+      model({
+        herds: [
+          herd({ label: "work", pid: 111, herdId: "a", isLocal: true }),
+          herd({
+            label: "work",
+            pid: 222,
+            herdId: "b",
+            isLocal: false,
+            user: "ege",
+            hostname: "mac",
+            role: "satellite",
+          }),
+        ],
+      }),
+    );
+    const rendered = text(blocks);
+    expect(rendered).toContain("Herds");
+    expect(rendered).toContain("pid `111`");
+    expect(rendered).toContain("pid `222`");
+    expect(rendered).toContain("ege@mac");
+  });
+
+  it("says no herdr is reachable when every herd is down", () => {
+    const blocks = buildHome(
+      model({
+        herdr: "waiting",
+        agents: [],
+        herds: [herd({ herdrStatus: "waiting", agentCount: 0 })],
+      }),
+    );
+    expect(text(blocks)).toContain("not reachable");
   });
 
   it("explains itself when there are no agents yet", () => {
@@ -83,7 +138,12 @@ describe("buildHome", () => {
 
   it("shows the needs-you section with a count", () => {
     const blocks = buildHome(
-      model({ agents: [agent({ status: "blocked" }), agent({ ref: "r2", status: "done" })] }),
+      model({
+        agents: [
+          agent({ status: "blocked" }),
+          agent({ ref: "r2", actionValue: "r2", status: "done" }),
+        ],
+      }),
     );
     expect(text(blocks)).toContain("NEEDS YOU (2)");
   });
@@ -95,7 +155,11 @@ describe("buildHome", () => {
   it("carries only an opaque ref in button values", () => {
     // Never a pane id: pane.move reassigns those, so a stale button could reach
     // a different live terminal.
-    const blocks = buildHome(model({ agents: [agent({ ref: "opaque-ref", status: "blocked" })] }));
+    const blocks = buildHome(
+      model({
+        agents: [agent({ ref: "opaque-ref", actionValue: "opaque-ref", status: "blocked" })],
+      }),
+    );
     const rendered = text(blocks);
     expect(rendered).toContain("opaque-ref");
     expect(rendered).not.toContain("w1:p");
@@ -106,15 +170,18 @@ describe("buildHome", () => {
     expect(text(buildHome(model({ slackConnected: false })))).toContain("reconnecting");
   });
 
-  it("shows how stale the view is, so a dead socket is never invisible", () => {
-    expect(text(buildHome(model({ syncedAgoMs: 45_000 })))).toContain("synced 45s ago");
-    expect(text(buildHome(model({ syncedAgoMs: 500 })))).toContain("synced just now");
+  it("shows how stale herdr sync is, and that Refresh re-syncs", () => {
+    expect(text(buildHome(model({ herdrSyncedAgoMs: 45_000 })))).toContain("herdr synced 45s ago");
+    expect(text(buildHome(model({ herdrSyncedAgoMs: 500 })))).toContain("herdr synced just now");
   });
 
   it("groups agents under their workspace", () => {
     const blocks = buildHome(
       model({
-        agents: [agent({ workspaceLabel: "alpha" }), agent({ ref: "r2", workspaceLabel: "beta" })],
+        agents: [
+          agent({ workspaceLabel: "alpha" }),
+          agent({ ref: "r2", actionValue: "r2", workspaceLabel: "beta" }),
+        ],
       }),
     );
     const rendered = text(blocks);
@@ -124,9 +191,9 @@ describe("buildHome", () => {
 
   it("pluralises the agent count correctly", () => {
     expect(text(buildHome(model()))).toContain("1 agent");
-    expect(text(buildHome(model({ agents: [agent(), agent({ ref: "r2" })] })))).toContain(
-      "2 agents",
-    );
+    expect(
+      text(buildHome(model({ agents: [agent(), agent({ ref: "r2", actionValue: "r2" })] }))),
+    ).toContain("2 agents");
   });
 });
 
@@ -137,7 +204,6 @@ describe("agentFromPane", () => {
       "r1",
       "project",
       "working",
-      false,
     );
     expect(result.title).toBe("clean title");
   });
@@ -148,7 +214,6 @@ describe("agentFromPane", () => {
       "r1",
       "project",
       "unknown",
-      false,
     );
     expect(result.title).toBe("(untitled)");
     expect(result.agent).toBe("agent");
@@ -161,6 +226,7 @@ describe("a herd too large for one view", () => {
     Array.from({ length: count }, (_, i) =>
       agent({
         ref: `r${i}`,
+        actionValue: `r${i}`,
         terminalId: `term_${i}`,
         title: `task ${i}`,
         status: i === 0 ? "blocked" : "working",
@@ -176,10 +242,10 @@ describe("a herd too large for one view", () => {
 
   it("still shows every blocked agent, and says how many it hid", () => {
     const blocks = buildHome({ ...model(), agents: many(300) });
-    const text = JSON.stringify(blocks);
-    expect(text).toContain("NEEDS YOU");
-    expect(text).toContain("task 0");
-    expect(text).toMatch(/and \d+ more/);
+    const rendered = JSON.stringify(blocks);
+    expect(rendered).toContain("NEEDS YOU");
+    expect(rendered).toContain("task 0");
+    expect(rendered).toMatch(/and \d+ more/);
   });
 
   it("leaves a small herd untouched", () => {
@@ -192,7 +258,7 @@ describe("an agent with no ref yet", () => {
   it("renders the row without a button, rather than an empty-valued one", () => {
     // Slack rejects a button whose value is "" — and rejects the *entire view*
     // with it, so one unregistered agent blanked the whole Home tab.
-    const blocks = buildHome({ ...model(), agents: [agent({ ref: "" })] });
+    const blocks = buildHome({ ...model(), agents: [agent({ ref: "", actionValue: "" })] });
     const rendered = JSON.stringify(blocks);
 
     expect(rendered).not.toContain('"value":""');
@@ -204,7 +270,7 @@ describe("an agent with no ref yet", () => {
     const link = "https://acme.slack.com/archives/D1/p111222?thread_ts=111.222&cid=D1";
     const blocks = buildHome({
       ...model(),
-      agents: [agent({ ref: "abc", status: "blocked", permalink: link })],
+      agents: [agent({ ref: "abc", actionValue: "abc", status: "blocked", permalink: link })],
     });
     const rendered = text(blocks);
     expect(rendered).toContain(link);
@@ -212,7 +278,10 @@ describe("an agent with no ref yet", () => {
   });
 
   it("never emits an empty value for a blocked agent either", () => {
-    const blocks = buildHome({ ...model(), agents: [agent({ ref: "", status: "blocked" })] });
+    const blocks = buildHome({
+      ...model(),
+      agents: [agent({ ref: "", actionValue: "", status: "blocked" })],
+    });
     expect(JSON.stringify(blocks)).not.toContain('"value":""');
   });
 });
