@@ -189,12 +189,20 @@ export class Surfaces {
       this.#scheduleHome();
     });
     tail.on("ready", () => {
-      this.#lastSyncAt = Date.now();
       this.reconcileSessions();
       this.#scheduleHome();
     });
-    tail.on("status", ({ status }) => {
-      if (status === "connected") this.#lastSyncAt = Date.now();
+    // "synced Ns ago" tracks this, not the connect-time "ready" alone — a
+    // healthy daemon that has been connected for hours without a hiccup was
+    // showing that whole duration as "stale" because nothing had touched the
+    // clock since the original connect. `synced` fires on every reconcile,
+    // including the 30s periodic one, so the number reflects actual freshness
+    // and only grows large when reconciling is genuinely failing.
+    tail.on("synced", () => {
+      this.#lastSyncAt = Date.now();
+      this.#scheduleHome();
+    });
+    tail.on("status", () => {
       this.#scheduleHome();
       // Strip or restore session-card buttons when herdr flaps. Sleep freezes
       // us before we can do this; this covers awake-but-disconnected.
@@ -742,10 +750,16 @@ export class Surfaces {
     };
   }
 
-  /** Refresh: re-read herdr state, bump the sync clock, republish Home. */
+  /**
+   * Refresh: pull a fresh snapshot from herdr, not just re-render the cache.
+   *
+   * `tail.reconcile()` bumps the sync clock itself (via the `synced` event) —
+   * a plain re-render here without the live pull would satisfy the tap but
+   * leave the data exactly as stale as it was.
+   */
   async #resyncHerdr(userId: string): Promise<void> {
+    await this.deps.tail.reconcile();
     this.reconcileSessions();
-    this.#lastSyncAt = Date.now();
     await this.publishHome(userId);
   }
 

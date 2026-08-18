@@ -15,6 +15,13 @@ export interface EventTailEvents {
   status: [{ status: TailStatus; attempt: number; error?: string }];
   /** Emitted once per successful connect, after the replay has been applied. */
   ready: [];
+  /**
+   * Emitted after every reconcile that actually lands, on the periodic
+   * cadence as well as the connect-time one. This is what "synced Ns ago"
+   * should track — time since last *reconnect* looked like data staleness
+   * to a healthy daemon that just hadn't reconnected in hours.
+   */
+  synced: [];
 }
 
 /**
@@ -67,6 +74,7 @@ export class EventTail extends EventEmitter<EventTailEvents> {
     try {
       const snapshot = await this.client.snapshot();
       this.state.applySnapshot(snapshot);
+      this.emit("synced");
       return true;
     } catch {
       return false;
