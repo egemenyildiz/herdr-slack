@@ -99,11 +99,19 @@ const button = (
 });
 
 // Slack rejects empty button `value` and rejects the entire Home view with it.
+//
+// Deliberately no `url` here even when a permalink is known: Slack's own
+// clients (desktop and mobile, verified 2026-08-18) do not reliably navigate
+// a button whose `url` points back at a slack.com permalink — desktop flags
+// it with a warning triangle, mobile shows the loading spinner and then does
+// nothing. The API itself accepts the payload without complaint, so this is a
+// client-side quirk with self-referential Slack links specifically, not a
+// validation error. A plain mrkdwn link in the row text (see `agentRow`)
+// works reliably everywhere; this button stays action-only, useful mainly to
+// create/reattach a thread for an agent that does not have one yet.
 const openButton = (agent: HomeAgent): Block | undefined => {
   if (!agent.actionValue) return undefined;
-  return agent.permalink
-    ? button("Open", HOME_ACTIONS.openSession, agent.actionValue, undefined, agent.permalink)
-    : button("Open", HOME_ACTIONS.openSession, agent.actionValue);
+  return button("Open", HOME_ACTIONS.openSession, agent.actionValue);
 };
 
 /** Slack rejects `accessory: undefined`, so the key has to be absent entirely. */
@@ -187,9 +195,11 @@ export const MAX_HOME_BLOCKS = 100;
 const RESERVED_BLOCKS = 8;
 
 function agentRow(agent: HomeAgent, detailed: boolean): Block {
+  // A plain mrkdwn link, not a button `url` — see the note on `openButton`.
+  const openLink = agent.permalink ? ` · <${agent.permalink}|Open>` : "";
   const text = detailed
-    ? `${GLYPH[agent.status]} *${escapeMrkdwn(agent.agent)}* · ${escapeMrkdwn(agent.title)}\n\`${escapeMrkdwn(agent.cwd)}\``
-    : `${GLYPH[agent.status]} \`${escapeMrkdwn(agent.agent)}\`  ${escapeMrkdwn(agent.title)}`;
+    ? `${GLYPH[agent.status]} *${escapeMrkdwn(agent.agent)}* · ${escapeMrkdwn(agent.title)}${openLink}\n\`${escapeMrkdwn(agent.cwd)}\``
+    : `${GLYPH[agent.status]} \`${escapeMrkdwn(agent.agent)}\`  ${escapeMrkdwn(agent.title)}${openLink}`;
   return withOpen({ type: "section", text: { type: "mrkdwn", text } }, agent);
 }
 

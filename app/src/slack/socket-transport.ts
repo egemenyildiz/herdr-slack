@@ -45,6 +45,8 @@ export class SocketModeTransport implements SlackTransport {
   #connected = false;
   #lastFrameAt: number | null = null;
   #watchdog: NodeJS.Timeout | null = null;
+  /** Guards against the idle check and the readyState check both firing a recycle at once. */
+  #recycling = false;
   #connectionHandlers: ((connected: boolean) => void)[] = [];
   /** trigger_ids already handled, to drop Slack's redeliveries. */
   #deliveries = new DeliveryLedger();
@@ -79,6 +81,19 @@ export class SocketModeTransport implements SlackTransport {
     // Attached once: the receiver keeps the same client across a recycle, so
     // doing this in start() would stack a listener per reconnect.
     this.#receiver.client.on("ws_message", () => this.#touch());
+    // The idle-frame heuristic below only sees silence — it can't tell a
+    // quiet-but-healthy connection from one the client itself gave up on.
+    // These log the library's own state machine so a stuck reconnect leaves a
+    // trail instead of the total silence we saw on 2026-08-18: the daemon held
+    // zero TCP connections to Slack for the better part of an hour with no
+    // disconnect, no ping/pong warning, and no watchdog line at all.
+    this.#receiver.client.on("disconnected", () =>
+      this.#log("slack: client state -> disconnected"),
+    );
+    this.#receiver.client.on("reconnecting", () =>
+      this.#log("slack: client state -> reconnecting"),
+    );
+    this.#receiver.client.on("connected", () => this.#log("slack: client state -> connected"));
   }
 
   /** Forward Bolt's own warn/error into daemon.log; the daemon has no stderr. */
@@ -108,15 +123,30 @@ export class SocketModeTransport implements SlackTransport {
   async start(): Promise<void> {
     await this.#app.start();
     this.#setConnected(true);
-    this.#watchdog = setInterval(() => {
-      if (this.idleMs !== null && this.idleMs > IDLE_TEARDOWN_MS) {
-        this.#log(
-          `slack: no frame for ${Math.round((this.idleMs ?? 0) / 1000)}s, recycling socket`,
-        );
-        void this.#recycle();
-      }
-    }, 15_000);
+    this.#watchdog = setInterval(() => this.#checkHealth(), 15_000);
     this.#watchdog.unref?.();
+  }
+
+  /**
+   * Two independent checks, because 2026-08-18 showed the idle-frame heuristic
+   * alone is not enough: the daemon sat "connected" with zero TCP sockets open
+   * to Slack for the better part of an hour, and the client's own ping/pong
+   * timers never fired to say so either. `isActive()` reads the underlying
+   * WebSocket's actual readyState directly — no network round trip, and it
+   * catches a socket the client itself has lost track of.
+   */
+  #checkHealth(): void {
+    if (this.#recycling) return;
+    const active = this.#receiver.client.websocket?.isActive() ?? false;
+    if (this.#connected && !active) {
+      this.#log("slack: websocket reports inactive while still marked connected, recycling socket");
+      void this.#recycle();
+      return;
+    }
+    if (this.idleMs !== null && this.idleMs > IDLE_TEARDOWN_MS) {
+      this.#log(`slack: no frame for ${Math.round((this.idleMs ?? 0) / 1000)}s, recycling socket`);
+      void this.#recycle();
+    }
   }
 
   async stop(): Promise<void> {
@@ -328,13 +358,22 @@ export class SocketModeTransport implements SlackTransport {
 
   /* v8 ignore start -- needs a live socket to exercise */
   async #recycle(): Promise<void> {
+    if (this.#recycling) return;
+    this.#recycling = true;
     this.#setConnected(false);
     try {
       await this.#app.stop();
       await this.#app.start();
       this.#setConnected(true);
-    } catch {
-      // Bolt retries on its own; the next watchdog tick tries again.
+    } catch (error) {
+      // Bolt retries on its own; the next watchdog tick tries again. Logged
+      // rather than swallowed — a silent failure here looks identical to a
+      // healthy reconnect until buttons stop working.
+      this.#log(
+        `slack: recycle failed, still disconnected: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      this.#recycling = false;
     }
   }
   /* v8 ignore stop */

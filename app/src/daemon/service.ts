@@ -81,7 +81,12 @@ export function renderLaunchd(instance: string, shim: string): string {
   <dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardOutPath</key><string>${log}</string>
   <key>StandardErrorPath</key><string>${log}</string>
-  <key>ProcessType</key><string>Background</string>
+  <!-- Not "Background": that spawn type gets launchd's aggressive CPU/timer
+       throttling (see 'launchctl print' -> "spawn type = background"), which
+       coalesces the Slack Socket Mode ping/pong and idle-watchdog timers for
+       minutes at a time on an otherwise-awake machine. "Standard" is the
+       untouched, unthrottled tier a persistent websocket daemon needs. -->
+  <key>ProcessType</key><string>Standard</string>
 </dict>
 </plist>
 `;
