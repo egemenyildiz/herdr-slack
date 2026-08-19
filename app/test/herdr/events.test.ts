@@ -104,6 +104,28 @@ describe("EventTail", () => {
     expect(state.paneByTerminal("term_after")).toBeDefined();
   });
 
+  it("survives an event whose shape SessionState rejects and keeps processing", async () => {
+    // Valid JSON, wrong payload shape — seen live from herdr as a
+    // tab_created with no `tab` field, which crashed the daemon before this
+    // was caught (2026-08-19). Uses pane_moved with no `pane` here since
+    // tab_created is now separately guarded in SessionState itself; this
+    // exercises the catch-all for whatever the next unguarded shape is.
+    fake.on("session.snapshot", () => ({ snapshot: snapshot() }));
+    const applyErrors: string[] = [];
+    tail.on("applyError", ({ message }) => applyErrors.push(message));
+    tail.start();
+    await waitFor(() => fake.subscriberCount === 1);
+    fake.emitSubscriptionStarted();
+    await waitFor(() => state.primed);
+
+    fake.emitEvent({ type: "pane_moved", previous_pane_id: "w1:p1" });
+    fake.emitEvent({ type: "pane_created", pane: pane({ terminal_id: "term_after" }) });
+    await waitFor(() => state.paneByTerminal("term_after") !== undefined);
+
+    expect(state.paneByTerminal("term_after")).toBeDefined();
+    expect(applyErrors).toHaveLength(1);
+  });
+
   it("reconnects after herdr drops the connection", async () => {
     fake.on("session.snapshot", () => ({ snapshot: snapshot() }));
     tail.start();

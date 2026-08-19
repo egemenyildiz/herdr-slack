@@ -144,7 +144,11 @@ export class SessionState extends EventEmitter<SessionStateEvents> {
       }
       case "tab_created":
       case "tab_renamed": {
-        const { tab } = event as { tab: TabInfo };
+        const { tab } = event as { tab?: TabInfo };
+        // Seen live from herdr with `tab` absent; the 30s reconcile repairs
+        // the projection either way, so drop the malformed frame rather than
+        // crash the whole daemon on it.
+        if (!tab) break;
         this.tabs.set(tab.tab_id, tab);
         this.emit("changed");
         break;

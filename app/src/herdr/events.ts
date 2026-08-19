@@ -22,6 +22,8 @@ export interface EventTailEvents {
    * to a healthy daemon that just hadn't reconnected in hours.
    */
   synced: [];
+  /** A live event's shape didn't match what SessionState expects; dropped, not fatal. */
+  applyError: [{ message: string }];
 }
 
 /**
@@ -156,7 +158,18 @@ export class EventTail extends EventEmitter<EventTailEvents> {
 
     const envelope = message as Partial<EventEnvelope>;
     if (envelope.data && typeof envelope.data === "object") {
-      this.state.apply(envelope.data);
+      // A shape the projection doesn't expect is as survivable as a
+      // malformed frame above — seen live from herdr as a `tab_created` with
+      // no `tab` field, which took the whole daemon down in a crash loop
+      // (2026-08-19) since nothing here was catching it. The 30s reconcile
+      // repairs drift either way.
+      try {
+        this.state.apply(envelope.data);
+      } catch (error) {
+        this.emit("applyError", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   }
 

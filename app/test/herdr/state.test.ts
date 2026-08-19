@@ -172,6 +172,13 @@ describe("SessionState", () => {
       expect(state.paneByTerminal(p.terminal_id)).toBeUndefined();
       expect(state.terminalByPane.get("w9:p1")).toBeUndefined();
     });
+
+    it("does not throw on a tab_created/tab_renamed event with no tab field", () => {
+      // Seen live from herdr — took the whole daemon down in a crash loop
+      // before this was guarded (2026-08-19).
+      expect(() => state.apply({ type: "tab_created" } as never)).not.toThrow();
+      expect(() => state.apply({ type: "tab_renamed" } as never)).not.toThrow();
+    });
   });
 
   describe("output signal", () => {

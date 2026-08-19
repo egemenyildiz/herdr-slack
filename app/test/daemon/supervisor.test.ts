@@ -149,12 +149,11 @@ describe("installProcessGuards", () => {
     });
     expect(listeners.exception).toHaveLength(1);
     listeners.exception[0]?.(new Error("sync boom"), "uncaughtException");
-    expect(errors).toEqual([
-      {
-        event: "daemon.uncaught_exception",
-        fields: { message: "sync boom", name: "Error" },
-      },
-    ]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.event).toBe("daemon.uncaught_exception");
+    expect(errors[0]?.fields.message).toBe("sync boom");
+    expect(errors[0]?.fields.name).toBe("Error");
+    expect(typeof errors[0]?.fields.stack).toBe("string");
     expect(exit).toHaveBeenCalledWith(1);
   });
 });

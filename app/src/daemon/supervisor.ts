@@ -189,6 +189,7 @@ export function installProcessGuards(log: ProcessGuardLog): void {
     log.error("daemon.uncaught_exception", {
       message: error.message,
       ...(error.name ? { name: error.name } : {}),
+      ...(error.stack ? { stack: error.stack } : {}),
     });
     process.exit(1);
   });

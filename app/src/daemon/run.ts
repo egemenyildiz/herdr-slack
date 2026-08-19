@@ -127,6 +127,9 @@ any problems below are what a real start would refuse on — this run continues 
   tail.on("status", ({ status, error }) => {
     log.event("herdr.status", { status, ...(error ? { error } : {}) });
   });
+  tail.on("applyError", ({ message }) => {
+    log.error("herdr.apply_error", { message });
+  });
   state.on("transition", (t) => {
     log.event("agent.transition", { terminalId: t.terminalId, from: t.from ?? null, to: t.to });
   });
