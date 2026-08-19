@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   installService,
+  parseLaunchctlPid,
   renderLaunchd,
   renderShim,
   renderSystemd,
@@ -109,5 +110,24 @@ describe("service units", () => {
     uninstallService("default", "linux");
     expect(existsSync(result.unit)).toBe(false);
     expect(existsSync(shimPath("default"))).toBe(false);
+  });
+});
+
+describe("parseLaunchctlPid", () => {
+  it("reads the pid while the job is running", () => {
+    const output = `
+	state = running
+	pid = 12165
+		state = active
+`;
+    expect(parseLaunchctlPid(output)).toBe(12165);
+  });
+
+  it("is undefined when the job is loaded but not running", () => {
+    const output = `
+	state = not running
+	stdout path = /Users/ege/.local/state/herdr/plugins/herdr-slack/default/daemon.log
+`;
+    expect(parseLaunchctlPid(output)).toBeUndefined();
   });
 });

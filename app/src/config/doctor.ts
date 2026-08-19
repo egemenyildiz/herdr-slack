@@ -1,5 +1,5 @@
 import { existsSync, statSync } from "node:fs";
-import { serviceStatus } from "../daemon/service.js";
+import { serviceLabel, serviceStatus } from "../daemon/service.js";
 import { isRunning, readRecord } from "../daemon/supervisor.js";
 import { HerdrClient } from "../herdr/client.js";
 import { type SlackApiError, authTest, installUrl, verifyAppToken } from "../slack/api.js";
@@ -163,11 +163,28 @@ async function checkSlack(
   return checks;
 }
 
-async function checkDaemon(instance: string): Promise<CheckResult> {
+/**
+ * A daemon can be "running" while launchd knows nothing about it: herdr's own
+ * `daemon ensure` startup hook is a fallback for people who skip the service,
+ * and it wins the lock race whenever it starts before (or instead of) the
+ * launchd job. That process has zero crash recovery — seen live running
+ * unsupervised for days before a crash finally took it down with nothing to
+ * bring it back. Loaded-but-a-different-pid is the tell.
+ */
+async function checkDaemon(instance: string, home?: string): Promise<CheckResult> {
   const record = readRecord(instance);
-  return (await isRunning(instance))
-    ? pass("daemon", `running${record?.pid ? ` (pid ${record.pid})` : ""}`)
-    : warn("daemon", "not running", command(`daemon start --instance ${instance}`));
+  if (!(await isRunning(instance))) {
+    return warn("daemon", "not running", command(`daemon start --instance ${instance}`));
+  }
+  const service = serviceStatus(instance, undefined, home);
+  if (service.installed && service.loaded && record?.pid && service.runningPid !== record.pid) {
+    return warn(
+      "daemon",
+      `running (pid ${record.pid}) but NOT the service-managed process — it will not restart itself if it crashes`,
+      `launchctl kickstart -k gui/$(id -u)/${serviceLabel(instance)}`,
+    );
+  }
+  return pass("daemon", `running${record?.pid ? ` (pid ${record.pid})` : ""}`);
 }
 
 /**
@@ -273,7 +290,7 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
   checks.push(
     ...(offline ? [warn("slack", "skipped (offline)")] : await checkSlack(resolved, fetchImpl)),
   );
-  checks.push(await checkDaemon(instance));
+  checks.push(await checkDaemon(instance, home));
   checks.push(checkService(instance, home));
   checks.push(
     offline

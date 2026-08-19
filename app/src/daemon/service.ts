@@ -276,6 +276,23 @@ export interface ServiceStatus {
   targetOk: boolean;
   unit: string;
   detail?: string;
+  /**
+   * pid launchd is currently running for this job, darwin only.
+   *
+   * Absent means "not currently running under launchd" — which is different
+   * from `loaded`: a job can be loaded (registered) but not running because
+   * something else already holds the daemon lock. That something else is
+   * usually herdr's own `daemon ensure` startup-hook fallback, which has no
+   * crash recovery at all — seen live losing the race after every reboot and
+   * running unsupervised for days before a crash finally killed it outright.
+   */
+  runningPid?: number;
+}
+
+/** `launchctl print` only has a `pid = N` line while the job is actively running. */
+export function parseLaunchctlPid(output: string): number | undefined {
+  const match = output.match(/^\s*pid = (\d+)/m);
+  return match?.[1] ? Number(match[1]) : undefined;
 }
 
 /**
@@ -306,17 +323,19 @@ export function serviceStatus(
   }
 
   let loaded = false;
+  let runningPid: number | undefined;
   let detail: string | undefined;
   try {
     if (platform === "darwin") {
-      execFileSync(
+      const out = execFileSync(
         "launchctl",
         ["print", `gui/${process.getuid?.() ?? 0}/${serviceLabel(instance)}`],
         {
           stdio: "pipe",
         },
-      );
+      ).toString();
       loaded = true;
+      runningPid = parseLaunchctlPid(out);
     } else {
       const out = execFileSync(
         "systemctl",
@@ -331,5 +350,12 @@ export function serviceStatus(
     detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
   }
 
-  return { installed, loaded, targetOk, unit, ...(detail === undefined ? {} : { detail }) };
+  return {
+    installed,
+    loaded,
+    targetOk,
+    unit,
+    ...(detail === undefined ? {} : { detail }),
+    ...(runningPid === undefined ? {} : { runningPid }),
+  };
 }

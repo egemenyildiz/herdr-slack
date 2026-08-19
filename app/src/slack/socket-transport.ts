@@ -31,6 +31,18 @@ import type {
  */
 const IDLE_TEARDOWN_MS = 90_000;
 
+/**
+ * Bound on one recycle attempt (stop + start).
+ *
+ * Without this, a hung `app.start()` — seen live as a promise that never
+ * settled, alongside "recycle failed: undefined" from something rejecting
+ * with no reason at all — leaves `#recycling` stuck `true` forever, since its
+ * `finally` never runs. Every later watchdog tick then no-ops on the guard,
+ * silently disabling recovery for good. A timeout forces the attempt to fail
+ * fast so the next tick gets a real try.
+ */
+const RECYCLE_TIMEOUT_MS = 20_000;
+
 type AnyRecord = Record<string, unknown>;
 
 /** Bolt payloads → untrusted records; fields read with `str` at the boundary. */
@@ -361,9 +373,19 @@ export class SocketModeTransport implements SlackTransport {
     if (this.#recycling) return;
     this.#recycling = true;
     this.#setConnected(false);
+    let timer: NodeJS.Timeout | undefined;
     try {
-      await this.#app.stop();
-      await this.#app.start();
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("recycle timed out")), RECYCLE_TIMEOUT_MS);
+        timer.unref?.();
+      });
+      await Promise.race([
+        (async () => {
+          await this.#app.stop();
+          await this.#app.start();
+        })(),
+        timeout,
+      ]);
       this.#setConnected(true);
     } catch (error) {
       // Bolt retries on its own; the next watchdog tick tries again. Logged
@@ -373,6 +395,7 @@ export class SocketModeTransport implements SlackTransport {
         `slack: recycle failed, still disconnected: ${error instanceof Error ? error.message : String(error)}`,
       );
     } finally {
+      if (timer) clearTimeout(timer);
       this.#recycling = false;
     }
   }
